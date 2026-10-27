@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 #  WIGGLES MINI  v1.4.1
 #  Inventario de equipos + utilidades para visitas a clientes.
 #  Portable, sin dependencias: PS1 + catalogos JSON.
