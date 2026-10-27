@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "_nota": "Catalogo de herramientas de la pestana HERRAMIENTAS. Tipo: portable (se descarga del repo y se descomprime), local (ya debe estar en Tools), winget (se instala desde winget/msstore) o url (abre la pagina oficial).",
+  "herramientas": [
+    {
+      "Id": "3DPChip",
+      "Nombre": "3DP Chip",
+      "Grupo": "Drivers",
+      "Descripcion": "Detecta el hardware y busca el driver que falta.",
+      "Tipo": "portable",
+      "Archivo": "3DPChip.zip",
+      "Carpeta": "Tools/Portables",
+      "Ejecutable": "3DP_Chip.exe",
+      "Args": "",
+      "MB": 4.9
+    },
+    {
+      "Id": "CrystalDiskInfo",
+      "Nombre": "CrystalDiskInfo",
+      "Grupo": "Portables",
+      "Descripcion": "Salud, temperatura y horas del disco (SMART).",
+      "Tipo": "portable",
+      "Archivo": "CrystalDiskInfo.zip",
+      "Carpeta": "Tools/Portables",
+      "Ejecutable": "CrystalDiskInfoPortable.exe",
+      "Args": "",
+      "MB": 6.2
+    },
+    {
+      "Id": "CrystalDiskMark",
+      "Nombre": "CrystalDiskMark",
+      "Grupo": "Portables",
+      "Descripcion": "Mide la velocidad real del disco.",
+      "Tipo": "portable",
+      "Archivo": "CrystalDiskMark.zip",
+      "Carpeta": "Tools/Portables",
+      "Ejecutable": "CrystalDiskMarkPortable.exe",
+      "Args": "",
+      "MB": 4.0
+    },
+    {
+      "Id": "HWiNFO",
+      "Nombre": "HWiNFO",
+      "Grupo": "Portables",
+      "Descripcion": "Sensores, temperaturas y detalle del hardware.",
+      "Tipo": "portable",
+      "Archivo": "HWiNFO.zip",
+      "Carpeta": "Tools/Portables",
+      "Ejecutable": "HWiNFOPortable.exe",
+      "Args": "",
+      "MB": 8.8
+    },
+    {
+      "Id": "UninstallTool",
+      "Nombre": "Uninstall Tool",
+      "Grupo": "Portables",
+      "Descripcion": "Desinstalador. Copia tu portable a Tools\\Instaladores\\UninstallTool.",
+      "Tipo": "local",
+      "RutaLocal": "Tools\\Instaladores\\UninstallTool\\UninstallToolPortable.exe",
+      "Args": "",
+      "MB": 0
+    },
+    {
+      "Id": "NitroPro9",
+      "Nombre": "Nitro Pro 9",
+      "Grupo": "Portables",
+      "Descripcion": "PDF. Copia tu instalador a Tools\\Instaladores\\NitroPro9.exe.",
+      "Tipo": "local",
+      "RutaLocal": "Tools\\Instaladores\\NitroPro9.exe",
+      "Args": "",
+      "MB": 0
+    },
+    {
+      "Id": "DellSupportAssist",
+      "Nombre": "Dell SupportAssist",
+      "Grupo": "Fabricante",
+      "Descripcion": "Drivers y firmware oficiales en equipos Dell.",
+      "Tipo": "winget",
+      "WingetId": "XPDCCXDN26VNBT",
+      "Fuente": "msstore",
+      "UrlAlt": "https://www.dell.com/support/home/es-mx",
+      "MB": 0
+    },
+    {
+      "Id": "HPSupportAssistant",
+      "Nombre": "HP Support Assistant",
+      "Grupo": "Fabricante",
+      "Descripcion": "Drivers oficiales en equipos HP.",
+      "Tipo": "winget",
+      "WingetId": "HP.SupportAssistant",
+      "Fuente": "winget",
+      "UrlAlt": "https://support.hp.com/es-es/drivers",
+      "MB": 0
+    },
+    {
+      "Id": "LenovoVantage",
+      "Nombre": "Lenovo Vantage",
+      "Grupo": "Fabricante",
+      "Descripcion": "Drivers oficiales en equipos Lenovo.",
+      "Tipo": "winget",
+      "WingetId": "9WZDNCRFJ4MV",
+      "Fuente": "msstore",
+      "UrlAlt": "https://www.lenovo.com/es/es/software/vantage",
+      "MB": 0
+    },
+    {
+      "Id": "IntelDSA",
+      "Nombre": "Intel Driver & Support",
+      "Grupo": "Fabricante",
+      "Descripcion": "Detecta y actualiza drivers Intel.",
+      "Tipo": "winget",
+      "WingetId": "Intel.IntelDriverAndSupportAssistant",
+      "Fuente": "winget",
+      "UrlAlt": "https://www.intel.com/content/www/es/es/support/detect.html",
+      "MB": 0
+    },
+    {
+      "Id": "AMD",
+      "Nombre": "AMD Drivers",
+      "Grupo": "Fabricante",
+      "Descripcion": "Pagina oficial de drivers AMD (auto-detecta el chipset).",
+      "Tipo": "url",
+      "UrlAlt": "https://www.amd.com/es/support/download/drivers.html",
+      "MB": 0
+    },
+    {
+      "Id": "NVIDIA",
+      "Nombre": "NVIDIA Drivers",
+      "Grupo": "Fabricante",
+      "Descripcion": "Pagina oficial de drivers NVIDIA.",
+      "Tipo": "url",
+      "UrlAlt": "https://www.nvidia.com/es-la/drivers/",
+      "MB": 0
+    }
+  ]
+}

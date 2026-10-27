@@ -1,0 +1,8 @@
+﻿Data/
+*.log
+Thumbs.db
+desktop.ini
+
+# Instaladores locales (Nitro, Uninstall Tool): no se publican
+Tools/Instaladores/*
+!Tools/Instaladores/LEEME.txt

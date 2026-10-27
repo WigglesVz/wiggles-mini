@@ -1,0 +1,17 @@
+Carpeta para tus instaladores locales
+=====================================
+
+Esta carpeta NO se publica en GitHub. Sirve para que las herramientas de pago
+o con licencia dudosa sigan funcionando sin internet, sin subirlas al repositorio.
+
+Copia aqui:
+
+  Tools\Instaladores\NitroPro9.exe
+  Tools\Instaladores\UninstallTool\UninstallToolPortable.exe
+
+La pestana HERRAMIENTAS los detecta solos: el boton cambia a "● Nitro Pro 9"
+o "● Uninstall Tool" y lo abre al instante. Si el archivo no esta, el boton
+avisa con la ruta exacta donde debe ir.
+
+El resto de herramientas (CrystalDiskInfo, CrystalDiskMark, HWiNFO, 3DP Chip)
+se descargan solas del repositorio la primera vez que las pulsas.

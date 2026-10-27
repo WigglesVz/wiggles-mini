@@ -1,0 +1,4017 @@
+# =============================================================================
+#  WIGGLES MINI  v1.4.1
+#  Inventario de equipos + utilidades para visitas a clientes.
+#  Portable, sin dependencias: PS1 + catalogos JSON.
+# =============================================================================
+#Requires -Version 5.1
+
+$ErrorActionPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$script:AppNombre  = 'WIGGLES MINI'
+$script:AppVersion = '1.5.1'
+
+# --- Ruta raiz (funciona desde USB, carpeta local o red) ---
+$script:Root = $PSScriptRoot
+if (-not $script:Root) {
+    try { $script:Root = Split-Path -Parent $MyInvocation.MyCommand.Definition } catch {}
+}
+if (-not $script:Root) { $script:Root = (Get-Location).Path }
+$script:Root = $script:Root.TrimEnd('\')
+
+# Normalizar rutas temporales (algunos equipos usan nombres 8.3 y Remove-Item falla con ellos)
+try { if ($env:TEMP) { $env:TEMP = [System.IO.Path]::GetFullPath($env:TEMP) } } catch {}
+try { if ($env:TMP)  { $env:TMP  = [System.IO.Path]::GetFullPath($env:TMP) } } catch {}
+
+$script:CorePath   = Join-Path $script:Root 'WigglesCore.ps1'
+$script:DataDir    = Join-Path $script:Root 'Data'
+$script:LogDir     = Join-Path $script:DataDir 'Logs'
+$script:QueueDir   = Join-Path $script:DataDir 'Pendientes'
+$script:OfficeDir  = Join-Path $script:Root 'External\Office'
+$script:ToolsDir   = Join-Path $script:Root 'Tools'
+
+foreach ($d in @($script:DataDir, $script:LogDir, $script:QueueDir, (Join-Path $script:DataDir 'Ajustes'))) {
+    if (-not (Test-Path $d)) { New-Item -Path $d -ItemType Directory -Force | Out-Null }
+}
+
+# --- Elevacion ---
+function Test-EsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+if (-not (Test-EsAdmin)) {
+    try {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`"" -Verb RunAs
+    } catch {}
+    exit
+}
+
+# --- Log ---
+$script:LogFile = Join-Path $script:LogDir ('Mini_{0}.log' -f (Get-Date -Format 'yyyy-MM-dd'))
+try {
+    Get-ChildItem -Path $script:LogDir -Filter 'Mini_*.log' -File |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 15 |
+        ForEach-Object { try { [IO.File]::Delete($_.FullName) } catch {} }
+} catch {}
+
+function Write-Log {
+    param([string]$Mensaje, [string]$Nivel = 'INFO')
+    $Linea = '{0} [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Nivel, $Mensaje
+    try { Add-Content -Path $script:LogFile -Value $Linea -Encoding UTF8 } catch {}
+    if ($script:txtLog) {
+        $script:txtLog.AppendText($Linea + "`r`n")
+        $script:txtLog.ScrollToEnd()
+    }
+}
+
+# --- Núcleo ---
+if (-not (Test-Path $script:CorePath)) {
+    [System.Windows.Forms.MessageBox]::Show("No se encontro WigglesCore.ps1 junto a este archivo.`n`nCarpeta: $script:Root", 'Wiggles Mini', 'OK', 'Error')
+    exit 1
+}
+. $script:CorePath
+
+# --- Configuracion ---
+$script:ConfigPath = Join-Path $script:Root 'config.json'
+$script:Config = [ordered]@{
+    Cliente             = ''
+    Tecnico             = $env:USERNAME
+    WebhookUrl          = ''
+    Token               = ''
+    AppsBasicas         = @('7zip.7zip', 'Google.Chrome', 'VideoLAN.VLC')
+    SincronizarAlGuardar = $true
+    RepoBase            = 'https://raw.githubusercontent.com/WigglesVz/wiggles-mini/main'
+}
+
+if (Test-Path $script:ConfigPath) {
+    try {
+        $Leido = Get-Content -Path $script:ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($k in @($script:Config.Keys)) {
+            if ($null -ne $Leido.$k) { $script:Config[$k] = $Leido.$k }
+        }
+    } catch {
+        Write-Log "config.json invalido: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+# --- Catalogo de aplicaciones (winget) ---
+$script:AppsPath = Join-Path $script:Root 'apps.json'
+$script:AppsCatalogo = @()
+if (Test-Path $script:AppsPath) {
+    try {
+        $Catalogo = Get-Content -Path $script:AppsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($a in @($Catalogo.apps)) {
+            if (-not $a.Id) { continue }
+            $cat = [string]$a.Categoria
+            if (-not $cat) { $cat = 'Otras' }
+            $script:AppsCatalogo += [PSCustomObject]@{
+                Id           = [string]$a.Id
+                Nombre       = [string]$a.Nombre
+                Categoria    = $cat
+                Descripcion  = [string]$a.Descripcion
+                Recomendada  = [bool]$a.Recomendada
+                Seleccionada = $false
+            }
+        }
+    } catch {
+        Write-Log "apps.json invalido: $($_.Exception.Message)" 'WARN'
+    }
+}
+if ($script:AppsCatalogo.Count -eq 0) {
+    foreach ($id in @($script:Config['AppsBasicas'])) {
+        if (-not $id) { continue }
+        $script:AppsCatalogo += [PSCustomObject]@{
+            Id           = [string]$id
+            Nombre       = [string]$id
+            Categoria    = 'Basicas'
+            Descripcion  = 'Aplicacion basica'
+            Recomendada  = $true
+            Seleccionada = $false
+        }
+    }
+}
+
+# --- Catalogo AppX (apps preinstaladas) ---
+$script:AppxPath = Join-Path $script:Root 'appx.json'
+$script:AppxCatalogo = @()
+$script:AppxInstaladas = @()
+$script:AppxChecks = @{}
+if (Test-Path $script:AppxPath) {
+    try {
+        $CatAppx = Get-Content -Path $script:AppxPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($a in @($CatAppx.apps)) {
+            if (-not $a.Id) { continue }
+            $script:AppxCatalogo += [PSCustomObject]@{
+                Id            = [string]$a.Id
+                Nombre        = [string]$a.Nombre
+                Categoria     = if ($a.Categoria) { [string]$a.Categoria } else { 'Otras' }
+                Descripcion   = [string]$a.Descripcion
+                StoreId       = [string]$a.StoreId
+                Predeterminada = [bool]$a.Predeterminada
+                Seleccionada  = $false
+            }
+        }
+    } catch {
+        Write-Log "appx.json invalido: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+# --- Catalogo de herramientas externas (pestana HERRAMIENTAS) ---
+$script:ToolsPath = Join-Path $script:Root 'tools.json'
+$script:ToolsCatalogo = @()
+if (Test-Path $script:ToolsPath) {
+    try {
+        $CatTools = Get-Content -Path $script:ToolsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($t in @($CatTools.herramientas)) {
+            if (-not $t.Id) { continue }
+            $script:ToolsCatalogo += [PSCustomObject]@{
+                Id          = [string]$t.Id
+                Nombre      = [string]$t.Nombre
+                Grupo       = if ($t.Grupo) { [string]$t.Grupo } else { 'Portables' }
+                Descripcion = [string]$t.Descripcion
+                Tipo        = if ($t.Tipo) { [string]$t.Tipo } else { 'portable' }
+                Archivo     = [string]$t.Archivo
+                Carpeta     = [string]$t.Carpeta
+                Ejecutable  = [string]$t.Ejecutable
+                RutaLocal   = [string]$t.RutaLocal
+                Args        = [string]$t.Args
+                WingetId    = [string]$t.WingetId
+                Fuente      = if ($t.Fuente) { [string]$t.Fuente } else { 'winget' }
+                Url         = [string]$t.Url
+                UrlAlt      = [string]$t.UrlAlt
+                MB          = [double]$t.MB
+            }
+        }
+    } catch {
+        Write-Log "tools.json invalido: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+# --- Catalogo de ajustes (tweaks) ---
+$script:TweaksPath = Join-Path $script:Root 'tweaks.json'
+$script:TweaksEstadoPath = Join-Path $script:DataDir 'Ajustes\estado.json'
+$script:TweaksCatalogo = @()
+$script:TweaksEstado = [PSCustomObject]@{}
+$script:TweakBotones = @{}
+$script:TweakEstados = @{}
+if (Test-Path $script:TweaksPath) {
+    try {
+        $CatTweaks = Get-Content -Path $script:TweaksPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($t in @($CatTweaks.tweaks)) {
+            if (-not $t.Id) { continue }
+            $script:TweaksCatalogo += [PSCustomObject]@{
+                Id           = [string]$t.Id
+                Nombre       = [string]$t.Nombre
+                Descripcion  = [string]$t.Descripcion
+                Categoria    = if ($t.Categoria) { [string]$t.Categoria } else { 'Otros' }
+                Riesgo       = if ($t.Riesgo) { [string]$t.Riesgo } else { 'Seguro' }
+                Accion       = [bool]$t.Accion
+                SinDeshacer  = [bool]$t.SinDeshacer
+                Registro     = @($t.registry)
+                Servicios    = @($t.service)
+                Script       = @($t.InvokeScript)
+                UndoScript   = @($t.UndoScript)
+            }
+        }
+    } catch {
+        Write-Log "tweaks.json invalido: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Load-TweaksEstado {
+    $script:TweaksEstado = [PSCustomObject]@{}
+    if (Test-Path $script:TweaksEstadoPath) {
+        try {
+            $leido = Get-Content -Path $script:TweaksEstadoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($leido) { $script:TweaksEstado = $leido }
+        } catch {
+            Write-Log "Estado de ajustes invalido: $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+function Test-TweakAplicado {
+    param([string]$Id)
+    return ($script:TweaksEstado.PSObject.Properties.Name -contains $Id)
+}
+
+function Save-Config {
+    try {
+        $script:Config | ConvertTo-Json -Depth 5 | Out-File -FilePath $script:ConfigPath -Encoding UTF8 -Force
+    } catch { Write-Log "No se pudo guardar config.json" 'WARN' }
+}
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# =============================================================================
+#  INTERFAZ
+# =============================================================================
+$Xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        Title="Wiggles Mini" Height="800" Width="1220" MinHeight="660" MinWidth="1020"
+        WindowStartupLocation="CenterScreen" WindowStyle="None"
+        Background="#0B0F14" Foreground="#E6EDF3"
+        FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display">
+
+  <shell:WindowChrome.WindowChrome>
+    <shell:WindowChrome CaptionHeight="46" ResizeBorderThickness="6" CornerRadius="0" GlassFrameThickness="0"/>
+  </shell:WindowChrome.WindowChrome>
+
+  <Window.Resources>
+    <SolidColorBrush x:Key="Fondo" Color="#0B0F14"/>
+    <SolidColorBrush x:Key="Panel" Color="#121821"/>
+    <SolidColorBrush x:Key="PanelAlto" Color="#18202B"/>
+    <SolidColorBrush x:Key="Borde" Color="#1E2A38"/>
+    <SolidColorBrush x:Key="Verde" Color="#00E676"/>
+    <SolidColorBrush x:Key="Azul" Color="#29B6F6"/>
+    <SolidColorBrush x:Key="Texto" Color="#E6EDF3"/>
+    <SolidColorBrush x:Key="Tenue" Color="#8494A6"/>
+    <SolidColorBrush x:Key="Ambar" Color="#FFB300"/>
+    <SolidColorBrush x:Key="Rojo" Color="#FF5252"/>
+
+    <Style TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <Style x:Key="Etiqueta" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Tenue}"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="Margin" Value="0,0,0,3"/>
+    </Style>
+
+    <Style x:Key="Titulo" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource Verde}"/>
+      <Setter Property="FontSize" Value="15"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,10"/>
+    </Style>
+
+    <Style TargetType="TextBox">
+      <Setter Property="Background" Value="#0F1520"/>
+      <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Borde}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="CaretBrush" Value="{StaticResource Verde}"/>
+      <Setter Property="SelectionBrush" Value="#2E7D32"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="5">
+              <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Verde}"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="BorderBrush" Value="#2C3B4D"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#18202B"/>
+      <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Borde}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="14,6"/>
+      <Setter Property="Margin" Value="0,0,8,8"/>
+      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="5">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                Margin="{TemplateBinding Padding}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#1F2B3A"/>
+                <Setter TargetName="bd" Property="BorderBrush" Value="#2E4053"/>
+              </Trigger>
+              <Trigger Property="IsPressed" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#0D141C"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.4"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="BotonVerde" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="#0E3B24"/>
+      <Setter Property="BorderBrush" Value="#1B7A46"/>
+      <Setter Property="Foreground" Value="#B9F6CA"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+
+    <Style x:Key="BotonAzul" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="#0E2A3B"/>
+      <Setter Property="BorderBrush" Value="#22688F"/>
+      <Setter Property="Foreground" Value="#B3E5FC"/>
+    </Style>
+
+    <Style x:Key="BotonAmbar" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="#3B2E0E"/>
+      <Setter Property="BorderBrush" Value="#8F6B22"/>
+      <Setter Property="Foreground" Value="#FFE082"/>
+    </Style>
+
+    <Style x:Key="BotonFantasma" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="10,6"/>
+    </Style>
+
+    <Style x:Key="Tarjeta" TargetType="Border">
+      <Setter Property="Background" Value="{StaticResource Panel}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Borde}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="16"/>
+      <Setter Property="Margin" Value="0,0,12,12"/>
+    </Style>
+
+    <Style TargetType="TabItem">
+      <Setter Property="Foreground" Value="{StaticResource Tenue}"/>
+      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="bd" Background="Transparent" Padding="18,10" Margin="0,0,4,0"
+                    CornerRadius="6,6,0,0" BorderThickness="0,0,0,2" BorderBrush="Transparent">
+              <ContentPresenter ContentSource="Header" HorizontalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Verde}"/>
+                <Setter Property="Foreground" Value="{StaticResource Verde}"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="TabControl">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabControl">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <Border Grid.Row="0" BorderBrush="{StaticResource Borde}" BorderThickness="0,0,0,1">
+                <TabPanel IsItemsHost="True" Margin="14,0,0,0"/>
+              </Border>
+              <ContentPresenter Grid.Row="1" ContentSource="SelectedContent"/>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="#0F1520"/>
+      <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource Borde}"/>
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ComboBox">
+            <Grid>
+              <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                <ToggleButton.Template>
+                  <ControlTemplate TargetType="ToggleButton">
+                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="1" CornerRadius="5">
+                      <Path Data="M 0 0 L 4 4 L 8 0" Stroke="#8494A6" StrokeThickness="1.5"
+                            HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                    </Border>
+                  </ControlTemplate>
+                </ToggleButton.Template>
+              </ToggleButton>
+
+              <ContentPresenter IsHitTestVisible="False" Margin="9,0,28,0" VerticalAlignment="Center"
+                                Content="{TemplateBinding SelectionBoxItem}"
+                                ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                TextElement.Foreground="{TemplateBinding Foreground}"/>
+
+              <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True" Focusable="False"
+                     PopupAnimation="Slide" IsOpen="{TemplateBinding IsDropDownOpen}">
+                <Border Background="#0F1520" BorderBrush="{StaticResource Borde}" BorderThickness="1"
+                        CornerRadius="5" MaxHeight="300"
+                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}">
+                  <ScrollViewer>
+                    <ItemsPresenter/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Setter Property="ItemContainerStyle">
+        <Setter.Value>
+          <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+            <Setter Property="Padding" Value="9,6"/>
+            <Setter Property="Template">
+              <Setter.Value>
+                <ControlTemplate TargetType="ComboBoxItem">
+                  <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+                    <ContentPresenter/>
+                  </Border>
+                  <ControlTemplate.Triggers>
+                    <Trigger Property="IsHighlighted" Value="True">
+                      <Setter Property="Background" Value="#16324A"/>
+                    </Trigger>
+                  </ControlTemplate.Triggers>
+                </ControlTemplate>
+              </Setter.Value>
+            </Setter>
+          </Style>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="{StaticResource Texto}"/>
+      <Setter Property="FontSize" Value="12.5"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <Grid Background="Transparent">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Border x:Name="box" Width="16" Height="16" CornerRadius="3"
+                      BorderBrush="#3A4A5C" BorderThickness="1" Background="#0B0F14"
+                      VerticalAlignment="Center">
+                <Path x:Name="check" Data="M 2 7 L 6 11 L 13 3" Stroke="#00E676"
+                      StrokeThickness="2" Stretch="None" Visibility="Collapsed"/>
+              </Border>
+              <ContentPresenter Grid.Column="1" Margin="8,0,0,0" VerticalAlignment="Center"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="check" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="box" Property="BorderBrush" Value="#00E676"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="box" Property="BorderBrush" Value="#29B6F6"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="BarraProgreso" TargetType="ProgressBar">
+      <Setter Property="Height" Value="3"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{StaticResource Verde}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+    </Style>
+
+    <!-- Barras de desplazamiento finas y acordes al tema oscuro -->
+    <ControlTemplate x:Key="BarraVerticalPlantilla" TargetType="ScrollBar">
+      <Grid Background="Transparent" SnapsToDevicePixels="True">
+        <Track x:Name="PART_Track" Orientation="Vertical" IsDirectionReversed="True">
+          <Track.DecreaseRepeatButton>
+            <RepeatButton Command="{x:Static ScrollBar.PageUpCommand}" Opacity="0"
+                          Focusable="False" IsTabStop="False"/>
+          </Track.DecreaseRepeatButton>
+          <Track.Thumb>
+            <Thumb MinHeight="24" Cursor="Hand">
+              <Thumb.Template>
+                <ControlTemplate TargetType="Thumb">
+                  <Border Background="#2B3A4A" CornerRadius="4" Margin="1,2,1,2"/>
+                </ControlTemplate>
+              </Thumb.Template>
+            </Thumb>
+          </Track.Thumb>
+          <Track.IncreaseRepeatButton>
+            <RepeatButton Command="{x:Static ScrollBar.PageDownCommand}" Opacity="0"
+                          Focusable="False" IsTabStop="False"/>
+          </Track.IncreaseRepeatButton>
+        </Track>
+      </Grid>
+    </ControlTemplate>
+
+    <ControlTemplate x:Key="BarraHorizontalPlantilla" TargetType="ScrollBar">
+      <Grid Background="Transparent" SnapsToDevicePixels="True">
+        <Track x:Name="PART_Track" Orientation="Horizontal" IsDirectionReversed="False">
+          <Track.DecreaseRepeatButton>
+            <RepeatButton Command="{x:Static ScrollBar.PageLeftCommand}" Opacity="0"
+                          Focusable="False" IsTabStop="False"/>
+          </Track.DecreaseRepeatButton>
+          <Track.Thumb>
+            <Thumb MinWidth="24" Cursor="Hand">
+              <Thumb.Template>
+                <ControlTemplate TargetType="Thumb">
+                  <Border Background="#2B3A4A" CornerRadius="4" Margin="2,1,2,1"/>
+                </ControlTemplate>
+              </Thumb.Template>
+            </Thumb>
+          </Track.Thumb>
+          <Track.IncreaseRepeatButton>
+            <RepeatButton Command="{x:Static ScrollBar.PageRightCommand}" Opacity="0"
+                          Focusable="False" IsTabStop="False"/>
+          </Track.IncreaseRepeatButton>
+        </Track>
+      </Grid>
+    </ControlTemplate>
+
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="9"/>
+      <Setter Property="MinWidth" Value="9"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template" Value="{StaticResource BarraVerticalPlantilla}"/>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="Height" Value="9"/>
+          <Setter Property="MinHeight" Value="9"/>
+          <Setter Property="Template" Value="{StaticResource BarraHorizontalPlantilla}"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="46"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- ================= ENCABEZADO ================= -->
+    <Border Grid.Row="0" Background="#0E141C" BorderBrush="{StaticResource Borde}" BorderThickness="0,0,0,1">
+      <Grid Margin="16,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+          <Border Width="8" Height="22" Background="{StaticResource Verde}" CornerRadius="2" Margin="0,0,10,0"/>
+          <TextBlock Text="WIGGLES" FontSize="16" FontWeight="Bold" Foreground="{StaticResource Texto}"/>
+          <TextBlock Text="MINI" FontSize="16" FontWeight="Bold" Foreground="{StaticResource Verde}" Margin="6,0,0,0"/>
+          <Border Background="#1B2634" CornerRadius="3" Padding="6,2" Margin="10,0,0,0" VerticalAlignment="Center">
+            <TextBlock Name="txtVersion" Text="v1.0" FontSize="10" Foreground="{StaticResource Tenue}"/>
+          </Border>
+        </StackPanel>
+
+        <TextBlock Grid.Column="1" Name="txtEncabezado" Text="Inventario para visitas a clientes"
+                   Foreground="{StaticResource Tenue}" FontSize="11.5" Margin="24,0,0,0"/>
+
+        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center"
+                    shell:WindowChrome.IsHitTestVisibleInChrome="True">
+          <Button Name="btnMin" Content="—" Style="{StaticResource BotonFantasma}" FontSize="14"
+                  Width="42" Height="30" Margin="0" ToolTip="Minimizar"/>
+          <Button Name="btnCerrar" Content="✕" Style="{StaticResource BotonFantasma}" FontSize="13"
+                  Width="42" Height="30" Margin="0" ToolTip="Cerrar"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- ================= CONTENIDO ================= -->
+    <TabControl Grid.Row="1" Name="tabs" Margin="6,4,6,0">
+
+      <!-- ===== INVENTARIO ===== -->
+      <TabItem Header="INVENTARIO">
+        <Grid Margin="14,14,14,6">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="430"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+
+          <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,14,0">
+            <StackPanel>
+              <TextBlock Text="DATOS DE LA VISITA" Style="{StaticResource Titulo}"/>
+
+              <TextBlock Text="CLIENTE" Style="{StaticResource Etiqueta}"/>
+              <TextBox Name="txtCliente" Margin="0,0,0,9"/>
+
+              <Grid Margin="0,0,0,9">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition/>
+                  <ColumnDefinition Width="12"/>
+                  <ColumnDefinition/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="SEDE / TECNICO" Style="{StaticResource Etiqueta}"/>
+                  <TextBox Name="txtSede"/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="ORDEN / ETIQUETA" Style="{StaticResource Etiqueta}"/>
+                  <TextBox Name="txtOrden"/>
+                </StackPanel>
+              </Grid>
+
+              <Border Height="1" Background="{StaticResource Borde}" Margin="0,4,0,14"/>
+
+              <TextBlock Text="EQUIPO" Style="{StaticResource Titulo}"/>
+
+              <TextBlock Text="SERIAL / SERVICE TAG" Style="{StaticResource Etiqueta}"/>
+              <TextBox Name="txtSerial" FontSize="15" FontWeight="Bold" Foreground="{StaticResource Verde}"
+                       Margin="0,0,0,9"/>
+
+              <Grid Margin="0,0,0,9">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition/>
+                  <ColumnDefinition Width="12"/>
+                  <ColumnDefinition/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0">
+                  <TextBlock Text="MARCA" Style="{StaticResource Etiqueta}"/>
+                  <TextBox Name="txtMarca"/>
+                </StackPanel>
+                <StackPanel Grid.Column="2">
+                  <TextBlock Text="MODELO" Style="{StaticResource Etiqueta}"/>
+                  <TextBox Name="txtModelo"/>
+                </StackPanel>
+              </Grid>
+
+              <TextBlock Text="COMENTARIOS / ESTADO" Style="{StaticResource Etiqueta}"/>
+              <TextBox Name="txtComentario" Height="66" AcceptsReturn="True" TextWrapping="Wrap"
+                       VerticalScrollBarVisibility="Auto" Margin="0,0,0,14"/>
+
+              <Button Name="btnEscanear" Content="ESCANEAR EQUIPO" Style="{StaticResource BotonAzul}"
+                      Height="38" Margin="0,0,0,8"/>
+              <Button Name="btnGuardarSiguiente" Content="GUARDAR Y SIGUIENTE EQUIPO ▸"
+                      Style="{StaticResource BotonVerde}" Height="42" FontSize="13" Margin="0,0,0,8"/>
+              <Button Name="btnGuardar" Content="GUARDAR SOLO ESTE EQUIPO" Height="34" Margin="0,0,0,8"/>
+
+              <WrapPanel>
+                <Button Name="btnExcel" Content="Exportar Excel" Height="30" FontSize="11.5"/>
+                <Button Name="btnSincronizar" Content="Sincronizar" Height="30" FontSize="11.5"/>
+                <Button Name="btnCarpeta" Content="Abrir carpeta" Height="30" FontSize="11.5"/>
+              </WrapPanel>
+
+              <Border Background="#101822" BorderBrush="{StaticResource Borde}" BorderThickness="1"
+                      CornerRadius="6" Padding="10,8" Margin="0,6,0,0">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="Sesion:" Foreground="{StaticResource Tenue}" FontSize="11.5"/>
+                  <TextBlock Name="txtContador" Text="0 equipos" Foreground="{StaticResource Verde}"
+                             FontSize="11.5" FontWeight="SemiBold" Margin="6,0,0,0"/>
+                  <TextBlock Name="txtPendientes" Text="" Foreground="{StaticResource Ambar}"
+                             FontSize="11.5" Margin="16,0,0,0"/>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+
+          <Border Grid.Column="1" Style="{StaticResource Tarjeta}" Margin="0,0,0,10">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+                <TextBlock Text="FICHA DEL EQUIPO" Style="{StaticResource Titulo}" Margin="0"/>
+                <TextBlock Name="txtScanEstado" Text="sin escanear" Foreground="{StaticResource Tenue}"
+                           FontSize="11" Margin="12,0,0,0"/>
+              </StackPanel>
+              <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                <StackPanel Name="pnlHardware"/>
+              </ScrollViewer>
+            </Grid>
+          </Border>
+        </Grid>
+      </TabItem>
+
+      <!-- ===== SISTEMA ===== -->
+      <TabItem Header="SISTEMA">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <Grid Margin="14,14,14,10">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition/>
+              <ColumnDefinition/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0">
+              <TextBlock Text="ESTADO DEL EQUIPO" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel Name="pnlEstadoSistema"/>
+              </Border>
+
+              <TextBlock Text="SEGURIDAD Y RED" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel Name="pnlSeguridadSistema"/>
+              </Border>
+            </StackPanel>
+
+            <StackPanel Grid.Column="1">
+              <TextBlock Text="LICENCIAMIENTO" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel>
+                  <TextBlock Name="txtLicencia" Text="Windows: detectando...   Office: detectando..."
+                             Foreground="{StaticResource Tenue}" FontSize="11.5" Margin="0,0,0,12" TextWrapping="Wrap"/>
+                  <Button Name="btnEdicion" Content="CAMBIAR EDICION  (Home → Pro)" Height="34" Margin="0,0,0,4"/>
+                  <TextBlock Text="Wiggles solo lee el estado de la licencia. Para activar, usa Configuracion → Sistema → Activacion de Windows con la licencia del cliente."
+                             Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <TextBlock Text="DIAGNOSTICO" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel>
+                  <Button Name="btnClaveBios" Content="Ver clave de Windows en BIOS (OA3)" Margin="0,0,0,6"/>
+                  <Button Name="btnReporteSalud" Content="Reporte de salud (PDF)" Style="{StaticResource BotonVerde}" Margin="0,0,0,6"/>
+                  <Button Name="btnReporteBateria" Content="Generar reporte de bateria (HTML)" Margin="0,0,0,6"/>
+                  <Button Name="btnResumenEquipo" Content="Ver resumen completo del equipo" Margin="0,0,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <Border Background="#101822" BorderBrush="{StaticResource Borde}" BorderThickness="1"
+                      CornerRadius="6" Padding="10,8" Margin="0,4,0,0">
+                <TextBlock Text="El estado se actualiza al escanear el equipo. El mantenimiento y las reparaciones estan en la pestana MANTENIMIENTO."
+                           Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap"/>
+              </Border>
+            </StackPanel>
+          </Grid>
+        </ScrollViewer>
+      </TabItem>
+
+      <!-- ===== SOFTWARE ===== -->
+      <TabItem Header="SOFTWARE">
+        <Grid Margin="14,14,14,10">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="390"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+
+          <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Margin="0,0,14,0">
+            <StackPanel>
+              <TextBlock Text="MICROSOFT OFFICE" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel>
+                  <TextBlock Name="txtOfficeEstado" Text="Verificando..." Foreground="{StaticResource Tenue}"
+                             FontSize="11.5" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                  <Button Name="btnOffice" Content="INSTALAR OFFICE 2024" Style="{StaticResource BotonVerde}"
+                          Height="40" Margin="0,0,0,6"/>
+                  <Button Name="btnQuitarOffice" Content="Desinstalar Office existente" Margin="0,0,0,0"/>
+                  <TextBlock Text="Office 2024 se descarga de internet durante la instalacion (~2 GB). Necesita conexion estable."
+                             Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <TextBlock Text="APLICACIONES BASICAS" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel>
+                  <TextBlock Name="txtAppsLista" Text="7-Zip · Chrome · VLC" Foreground="{StaticResource Tenue}"
+                             FontSize="11.5" TextWrapping="Wrap" Margin="0,0,0,10"/>
+                  <Button Name="btnApps" Content="INSTALAR APLICACIONES BASICAS" Style="{StaticResource BotonAzul}"
+                          Height="36" Margin="0,0,0,6"/>
+                  <Button Name="btnAbrirCatalogo" Content="ABRIR CATALOGO COMPLETO" Height="30" Margin="0,0,0,0"/>
+                  <TextBlock Text="El catalogo completo permite buscar por categoria y elegir que instalar."
+                             Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <TextBlock Text="COMPLEMENTOS" Style="{StaticResource Titulo}"/>
+              <Border Style="{StaticResource Tarjeta}">
+                <StackPanel>
+                  <Button Name="btnRuntimes" Content="Instalar runtimes (Visual C++ / .NET)" Margin="0,0,0,0"/>
+                </StackPanel>
+              </Border>
+
+              <Border Background="#101822" BorderBrush="{StaticResource Borde}" BorderThickness="1"
+                      CornerRadius="6" Padding="10,8" Margin="0,4,0,0">
+                <TextBlock Text="Las instalaciones por winget y Office requieren conexion a internet. Si winget falla, repara el instalador desde MANTENIMIENTO."
+                           Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap"/>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+
+          <Border Grid.Column="1" Style="{StaticResource Tarjeta}" Margin="0,0,0,10">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+
+              <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+                <TextBlock Text="SOFTWARE INSTALADO" Style="{StaticResource Titulo}" Margin="0"/>
+                <TextBlock Name="txtSoftwareResumen" Text="sin datos" Foreground="{StaticResource Tenue}"
+                           FontSize="11" Margin="12,2,0,0"/>
+              </StackPanel>
+
+              <Grid Grid.Row="1" Margin="0,0,0,8">
+                <TextBox Name="txtBuscarSoftware" Height="30"
+                         ToolTip="Filtrar el software instalado por nombre o version"/>
+                <TextBlock Name="txtBuscarSoftwareHint" Text="Buscar programa..." Foreground="#5B6B7C"
+                           FontSize="12" Margin="11,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+              </Grid>
+
+              <TextBox Name="txtSoftwareLista" Grid.Row="2" IsReadOnly="True" AcceptsReturn="True"
+                       TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto"
+                       HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" FontSize="11.5"
+                       Background="#0F1520" Foreground="#B8C6D4" BorderBrush="{StaticResource Borde}"
+                       Padding="8" Text="Escanea un equipo para ver el software instalado."/>
+            </Grid>
+          </Border>
+        </Grid>
+      </TabItem>
+
+      <!-- ===== APLICACIONES ===== -->
+      <TabItem Header="APLICACIONES">
+        <Grid Margin="14,14,14,10">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <Grid Grid.Row="0" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="10"/>
+              <ColumnDefinition Width="210"/>
+            </Grid.ColumnDefinitions>
+            <TextBox Name="txtBuscarApp" Grid.Column="0" Height="32"
+                     ToolTip="Buscar por nombre, descripcion o id de winget"/>
+            <TextBlock Name="txtBuscarHint" Text="Buscar aplicacion..." Foreground="#5B6B7C"
+                       FontSize="12" Margin="11,0,0,0" VerticalAlignment="Center" IsHitTestVisible="False"/>
+            <ComboBox Name="cmbCategoriaApp" Grid.Column="2" Height="32"/>
+          </Grid>
+
+          <TextBlock Name="txtAppsResumen" Grid.Row="1" Foreground="{StaticResource Tenue}"
+                     FontSize="11" Margin="0,0,0,6" Text="Cargando catalogo..."/>
+
+          <Border Grid.Row="2" Style="{StaticResource Tarjeta}" Padding="2" Margin="0,0,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Name="pnlApps" Margin="2"/>
+            </ScrollViewer>
+          </Border>
+
+          <Grid Grid.Row="3" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button Name="btnInstalarApps" Content="INSTALAR SELECCIONADAS" Style="{StaticResource BotonVerde}"
+                    Height="36" Padding="16,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppsRecomendadas" Grid.Column="1" Content="SELECCIONAR RECOMENDADAS"
+                    Height="36" Padding="12,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppsLimpiar" Grid.Column="2" Content="LIMPIAR" Height="36" Padding="12,0"/>
+            <TextBlock Name="txtAppsEstado" Grid.Column="3" Foreground="{StaticResource Tenue}"
+                       FontSize="11" TextWrapping="Wrap" Margin="12,0,0,0"
+                       Text="Marca las aplicaciones y pulsa INSTALAR SELECCIONADAS."/>
+          </Grid>
+        </Grid>
+      </TabItem>
+
+      <!-- ===== AJUSTES ===== -->
+      <TabItem Header="AJUSTES">
+        <Grid Margin="14,14,14,10">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <StackPanel Grid.Row="0" Margin="0,0,0,8">
+            <TextBlock Text="AJUSTES DE WINDOWS" Style="{StaticResource Titulo}"/>
+            <TextBlock Text="Privacidad, interfaz y sistema. Cada ajuste guarda su valor original para poder deshacerlo."
+                       Foreground="{StaticResource Tenue}" FontSize="11" TextWrapping="Wrap"/>
+          </StackPanel>
+
+          <Border Grid.Row="1" Style="{StaticResource Tarjeta}" Padding="8" Margin="0,0,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Name="pnlTweaks"/>
+            </ScrollViewer>
+          </Border>
+
+          <Grid Grid.Row="2" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Name="txtTweaksEstado" Grid.Column="0" Foreground="{StaticResource Tenue}"
+                       FontSize="11" TextWrapping="Wrap" Text="Cargando ajustes..."/>
+            <Button Name="btnTweaksRecargar" Grid.Column="1" Content="ACTUALIZAR ESTADO"
+                    Height="30" Padding="10,0" Margin="0,0,0,0"/>
+          </Grid>
+        </Grid>
+      </TabItem>
+
+      <!-- ===== MANTENIMIENTO ===== -->
+      <TabItem Header="MANTENIMIENTO">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="14,14,14,10">
+            <TextBlock Text="MANTENIMIENTO RAPIDO" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <WrapPanel>
+                <Button Name="btnPuntoRestauracion" Content="Crear punto de restauracion" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnBloatware" Content="Eliminar bloatware" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnRendimiento" Content="Plan de maximo rendimiento" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnRed" Content="Reparar red (winsock + DNS)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnCompactOS" Content="CompactOS (comprimir sistema)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnAdminLocal" Content="Crear administrador local" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnAbrirAppx" Content="Gestionar apps preinstaladas" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+              </WrapPanel>
+            </Border>
+
+            <TextBlock Text="REPARACIONES" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <WrapPanel>
+                <Button Name="btnFixSFC" Content="SFC + DISM" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnFixWU" Content="Resetear Windows Update" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnFixNTP" Content="Hora NTP (pool.ntp.org)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnFixTemp" Content="Limpiar temporales" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnFixDISM" Content="Limpiar componentes (DISM)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                <Button Name="btnFixWinget" Content="Reparar winget" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+              </WrapPanel>
+            </Border>
+
+            <TextBlock Text="RESPALDO Y CHEQUEO" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <StackPanel>
+                <WrapPanel>
+                  <Button Name="btnMiniBackupUsuario" Content="Mini-Backup del usuario" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                  <Button Name="btnRepararTienda" Content="Reparar tienda" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                  <Button Name="btnChkDsk" Content="CHKDSK rapido (analizar C:)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                </WrapPanel>
+                <TextBlock Text="El Mini-Backup copia Escritorio, Documentos, Imagenes, Descargas, Favoritos, Musica y Videos. Usalo antes de formatear."
+                           Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap"/>
+              </StackPanel>
+            </Border>
+
+            <TextBlock Text="CARACTERISTICAS DE WINDOWS" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <StackPanel>
+                <WrapPanel Name="pnlFeatures"/>
+                <Button Name="btnInstalarFeatures" Content="INSTALAR SELECCIONADAS" Style="{StaticResource BotonVerde}"
+                        Height="34" Padding="14,0" Margin="0,8,0,6"/>
+                <TextBlock Text="Algunas caracteristicas requieren reinicio. Hyper-V y Sandbox no estan disponibles en Windows Home."
+                           Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap"/>
+              </StackPanel>
+            </Border>
+
+            <TextBlock Text="PANELES CLASICOS" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <WrapPanel Name="pnlPaneles"/>
+            </Border>
+
+            <TextBlock Name="txtConfigEstado" Foreground="{StaticResource Tenue}" FontSize="11"
+                       TextWrapping="Wrap" Margin="0,2,0,0" Text="Selecciona una reparacion o caracteristica."/>
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+
+      <!-- ===== HERRAMIENTAS ===== -->
+      <TabItem Header="HERRAMIENTAS">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="14,14,14,10">
+            <TextBlock Text="DRIVERS" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <StackPanel>
+                <WrapPanel>
+                  <Button Name="btnBackupDrivers" Content="Backup de drivers" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                  <Button Name="btnRestaurarDrivers" Content="Restaurar drivers" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                  <Button Name="btnLimpiezaDrivers" Content="Limpieza de drivers fantasma" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                  <Button Name="btn3DPChip" Content="3DP Chip (buscar faltantes)" Height="32" Padding="12,0" Margin="0,0,8,8"/>
+                </WrapPanel>
+                <TextBlock Text="El backup y la restauracion usan herramientas de Windows: funcionan sin internet y sin pendrive."
+                           Foreground="{StaticResource Tenue}" FontSize="10.5" TextWrapping="Wrap"/>
+              </StackPanel>
+            </Border>
+
+            <TextBlock Text="APLICACIONES PORTABLES" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <WrapPanel Name="pnlPortables"/>
+            </Border>
+
+            <TextBlock Text="SOPORTE DEL FABRICANTE" Style="{StaticResource Titulo}"/>
+            <Border Style="{StaticResource Tarjeta}">
+              <WrapPanel Name="pnlFabricantes"/>
+            </Border>
+
+            <Grid Margin="0,6,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <TextBlock Name="txtToolsRuta" Grid.Column="0" Foreground="{StaticResource Tenue}" FontSize="10.5"
+                         TextWrapping="Wrap" VerticalAlignment="Center"/>
+              <Button Name="btnToolsActualizar" Grid.Column="1" Content="ACTUALIZAR" Height="28"
+                      Padding="10,0" Margin="0,0,6,0"/>
+              <Button Name="btnToolsCarpeta" Grid.Column="2" Content="ABRIR CARPETA" Height="28" Padding="10,0"/>
+            </Grid>
+
+            <TextBlock Name="txtToolsEstado" Foreground="{StaticResource Tenue}" FontSize="11"
+                       TextWrapping="Wrap" Margin="0,8,0,0"/>
+          </StackPanel>
+        </ScrollViewer>
+      </TabItem>
+
+      <!-- ===== APPX ===== -->
+      <TabItem Header="APPX">
+        <Grid Margin="14,14,14,10">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <StackPanel Grid.Row="0" Margin="0,0,0,8">
+            <TextBlock Text="APPS PREINSTALADAS (APPX)" Style="{StaticResource Titulo}"/>
+            <TextBlock Text="Selecciona apps para quitarlas o reinstalarlas. Las marcadas por defecto son bloatware comun."
+                       Foreground="{StaticResource Tenue}" FontSize="11" TextWrapping="Wrap"/>
+          </StackPanel>
+
+          <Border Grid.Row="1" Style="{StaticResource Tarjeta}" Padding="10" Margin="0,0,0,0">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Name="pnlAppx"/>
+            </ScrollViewer>
+          </Border>
+
+          <Grid Grid.Row="2" Margin="0,10,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Button Name="btnAppxQuitar" Content="QUITAR SELECCIONADAS" Style="{StaticResource BotonAmbar}"
+                    Height="34" Padding="12,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppxInstalar" Grid.Column="1" Content="INSTALAR SELECCIONADAS"
+                    Style="{StaticResource BotonVerde}" Height="34" Padding="12,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppxPredeterminados" Grid.Column="2" Content="PREDETERMINADOS"
+                    Height="34" Padding="10,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppxLimpiar" Grid.Column="3" Content="LIMPIAR"
+                    Height="34" Padding="10,0" Margin="0,0,8,0"/>
+            <Button Name="btnAppxDetectar" Grid.Column="4" Content="DETECTAR INSTALADAS"
+                    Height="34" Padding="10,0" Margin="0,0,8,0"/>
+            <TextBlock Name="txtAppxEstado" Grid.Column="5" Foreground="{StaticResource Tenue}"
+                       FontSize="11" TextWrapping="Wrap" Margin="8,0,0,0" Text="Cargando apps..."/>
+          </Grid>
+        </Grid>
+      </TabItem>
+
+    </TabControl>
+
+    <!-- ================= PIE ================= -->
+    <Border Grid.Row="2" Background="#0E141C" BorderBrush="{StaticResource Borde}" BorderThickness="0,1,0,0">
+      <Grid Margin="16,8,16,8">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <StackPanel Orientation="Horizontal">
+            <Border Name="bdEstado" Width="8" Height="8" CornerRadius="4" Background="{StaticResource Verde}"
+                    VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBlock Name="txtEstado" Text="Listo" Foreground="{StaticResource Tenue}" FontSize="11.5"/>
+          </StackPanel>
+          <TextBlock Grid.Column="1" Name="txtRuta" Text="" Foreground="#4A5A6B" FontSize="10.5"/>
+        </Grid>
+
+        <ProgressBar Grid.Row="1" Name="prgBarra" Style="{StaticResource BarraProgreso}"
+                     IsIndeterminate="False" Visibility="Hidden" Margin="0,6,0,0"/>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+try {
+    $Window = [Windows.Markup.XamlReader]::Parse($Xaml)
+} catch {
+    [System.Windows.Forms.MessageBox]::Show("Error al construir la interfaz:`n`n$($_.Exception.Message)", 'Wiggles Mini', 'OK', 'Error')
+    exit 1
+}
+
+# Ajustar la ventana al area util de la pantalla (evita que se salga con escalado DPI)
+try {
+    $Area = [System.Windows.SystemParameters]::WorkArea
+    $Ancho = [math]::Min(1220, [math]::Max(1020, $Area.Width - 24))
+    $Alto  = [math]::Min(800,  [math]::Max(620, $Area.Height - 24))
+    $Window.Width  = $Ancho
+    $Window.Height = $Alto
+    $Window.Left   = $Area.Left + [math]::Round(($Area.Width - $Ancho) / 2)
+    $Window.Top    = $Area.Top  + [math]::Round(($Area.Height - $Alto) / 2)
+} catch {}
+
+# Conectar controles
+try { [xml]$XamlDoc = $Xaml } catch {}
+$XamlDoc.SelectNodes('//*[@Name]') | ForEach-Object {
+    try {
+        $ctrl = $Window.FindName($_.Name)
+        if ($ctrl) { Set-Variable -Name $_.Name -Value $ctrl -Scope Script }
+    } catch {}
+}
+
+$script:txtLog = $null
+$txtVersion.Text = $script:AppVersion
+$txtRuta.Text = $script:Root
+
+# --- Barra de estado ---
+function Set-Estado {
+    param([string]$Texto, [string]$Tipo = 'ok')
+    $txtEstado.Text = $Texto
+    $Color = switch ($Tipo) {
+        'ok'    { '#00E676' }
+        'info'  { '#29B6F6' }
+        'warn'  { '#FFB300' }
+        'error' { '#FF5252' }
+        default { '#00E676' }
+    }
+    try { $bdEstado.Background = $Color } catch {}
+}
+
+$script:TareasActivas = 0
+
+function Set-Ocupado {
+    param([bool]$Activo)
+    $Botonera = @('btnEscanear', 'btnGuardar', 'btnGuardarSiguiente', 'btnExcel', 'btnSincronizar',
+                  'btnOffice', 'btnQuitarOffice', 'btnApps', 'btnInstalarApps', 'btnAppsRecomendadas',
+                  'btnAppsLimpiar', 'btnRuntimes', 'btnEdicion',
+                  'btnTweaksRecargar', 'btnAppxQuitar', 'btnAppxInstalar', 'btnAppxPredeterminados',
+                  'btnAppxLimpiar', 'btnAppxDetectar', 'btnInstalarFeatures',
+                  'btnPuntoRestauracion', 'btnBloatware', 'btnRendimiento', 'btnRed', 'btnAdminLocal',
+                  'btnFixSFC', 'btnFixWU', 'btnFixNTP', 'btnFixTemp', 'btnFixDISM', 'btnFixWinget')
+    foreach ($b in $Botonera) {
+        try { $Window.FindName($b).IsEnabled = -not $Activo } catch {}
+    }
+    foreach ($b in @($script:TweakBotones.Values)) {
+        try { $b.IsEnabled = -not $Activo } catch {}
+    }
+
+    if ($Activo) {
+        $prgBarra.IsIndeterminate = $true
+        $prgBarra.Visibility = 'Visible'
+    } else {
+        $prgBarra.IsIndeterminate = $false
+        $prgBarra.Visibility = 'Hidden'
+        if (Get-Command Update-TweakBotonTodos -ErrorAction SilentlyContinue) { Update-TweakBotonTodos }
+    }
+}
+
+# =============================================================================
+#  TAREAS EN SEGUNDO PLANO
+# =============================================================================
+$script:Tareas = New-Object System.Collections.ArrayList
+
+$script:TimerTareas = New-Object System.Windows.Threading.DispatcherTimer
+$script:TimerTareas.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:TimerTareas.Add_Tick({
+    if ($script:Tareas.Count -eq 0) { return }
+    for ($i = $script:Tareas.Count - 1; $i -ge 0; $i--) {
+        $t = $script:Tareas[$i]
+        if ($t.Handle.IsCompleted) {
+            $script:Tareas.RemoveAt($i)
+            $resultado = $null
+            $errorTxt = $null
+            try {
+                $resultado = $t.PS.EndInvoke($t.Handle)
+            } catch {
+                $errorTxt = $_.Exception.Message
+                try {
+                    $detalle = $t.PS.Streams.Error | ForEach-Object { $_.ToString() }
+                    if ($detalle) { $errorTxt = $detalle -join ' | ' }
+                } catch {}
+            }
+            try { $t.PS.Dispose() } catch {}
+            try { $t.RS.Dispose() } catch {}
+            $script:TareasActivas = [math]::Max(0, $script:TareasActivas - 1)
+            if ($script:TareasActivas -eq 0) { Set-Ocupado $false }
+            if ($t.OnDone) {
+                try { & $t.OnDone $resultado $errorTxt } catch { Write-Log "Error en callback: $($_.Exception.Message)" 'ERROR' }
+            }
+        }
+    }
+})
+$script:TimerTareas.Start()
+
+function Start-Tarea {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Script,
+        [object[]]$Argumentos = @(),
+        [scriptblock]$OnDone
+    )
+    $ps = [powershell]::Create()
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($Script)
+    foreach ($a in $Argumentos) { [void]$ps.AddArgument($a) }
+    $h = $ps.BeginInvoke()
+    [void]$script:Tareas.Add([PSCustomObject]@{ PS = $ps; RS = $rs; Handle = $h; OnDone = $OnDone })
+    $script:TareasActivas++
+    Set-Ocupado $true
+}
+
+# =============================================================================
+#  CAMPOS DE LA FICHA (panel derecho)
+# =============================================================================
+$script:CamposFicha = New-Object System.Collections.Specialized.OrderedDictionary
+
+function New-FilaFicha {
+    param([string]$Etiqueta, [string]$Clave, [bool]$Destacado = $false)
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = '0,0,0,7'
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition
+    $c1.Width = New-Object System.Windows.GridLength(158)
+    $c2 = New-Object System.Windows.Controls.ColumnDefinition
+    $c2.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $grid.ColumnDefinitions.Add($c1)
+    $grid.ColumnDefinitions.Add($c2)
+
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = $Etiqueta
+    $lbl.FontSize = 11
+    $lbl.Foreground = '#8494A6'
+    $lbl.TextWrapping = 'Wrap'
+    $lbl.VerticalAlignment = 'Top'
+    $lbl.Margin = '0,4,8,0'
+    [System.Windows.Controls.Grid]::SetColumn($lbl, 0)
+    $grid.Children.Add($lbl) | Out-Null
+
+    $val = New-Object System.Windows.Controls.TextBlock
+    $val.Text = ''
+    $val.FontSize = 12
+    $val.TextWrapping = 'Wrap'
+    $val.Foreground = if ($Destacado) { '#E6EDF3' } else { '#B8C6D4' }
+    if ($Destacado) { $val.FontWeight = 'SemiBold' }
+    [System.Windows.Controls.Grid]::SetColumn($val, 1)
+    $grid.Children.Add($val) | Out-Null
+
+    $script:CamposFicha[$Clave] = $val
+    return $grid
+}
+
+function Set-Ficha {
+    param([string]$Clave, [string]$Valor)
+    if ($script:CamposFicha.Contains($Clave)) {
+        $script:CamposFicha[$Clave].Text = if ([string]::IsNullOrWhiteSpace($Valor)) { '—' } else { $Valor }
+    }
+}
+
+$DefFicha = @(
+    [PSCustomObject]@{ E = 'Fabricante y modelo'; C = 'fMarca';     D = $true }
+    [PSCustomObject]@{ E = 'Tipo de equipo';      C = 'fTipo';      D = $false }
+    [PSCustomObject]@{ E = 'Procesador';          C = 'fCPU';       D = $true }
+    [PSCustomObject]@{ E = 'Nucleos / hilos';     C = 'fCores';     D = $false }
+    [PSCustomObject]@{ E = 'Memoria RAM';         C = 'fRAM';       D = $true }
+    [PSCustomObject]@{ E = 'Tipo / velocidad';    C = 'fRAMTipo';   D = $false }
+    [PSCustomObject]@{ E = 'Modulos';             C = 'fRAMMod';    D = $false }
+    [PSCustomObject]@{ E = 'Slots libres / max';  C = 'fSlots';     D = $false }
+    [PSCustomObject]@{ E = 'Disco';               C = 'fDisco';     D = $true }
+    [PSCustomObject]@{ E = 'Tipo / capacidad';    C = 'fDiscoTipo'; D = $false }
+    [PSCustomObject]@{ E = 'Espacio libre';       C = 'fLibre';     D = $false }
+    [PSCustomObject]@{ E = 'Salud / temperatura'; C = 'fSalud';     D = $false }
+    [PSCustomObject]@{ E = 'Bateria';             C = 'fBateria';   D = $true }
+    [PSCustomObject]@{ E = 'Desgaste / ciclos';   C = 'fDesgaste';  D = $false }
+    [PSCustomObject]@{ E = 'Sistema operativo';   C = 'fSO';        D = $true }
+    [PSCustomObject]@{ E = 'Version / build';     C = 'fBuild';     D = $false }
+    [PSCustomObject]@{ E = 'Windows';             C = 'fWinLic';    D = $false }
+    [PSCustomObject]@{ E = 'Office';              C = 'fOfficeLic'; D = $false }
+    [PSCustomObject]@{ E = 'Dominio / grupo';     C = 'fDominio';   D = $false }
+    [PSCustomObject]@{ E = 'IP / MAC';            C = 'fRed';       D = $false }
+    [PSCustomObject]@{ E = 'TPM';                 C = 'fTPM';       D = $false }
+    [PSCustomObject]@{ E = 'Secure Boot';         C = 'fSB';        D = $false }
+    [PSCustomObject]@{ E = 'Software instalado';  C = 'fSoftware';  D = $false }
+    [PSCustomObject]@{ E = 'Ultimo arranque';     C = 'fArranque';  D = $false }
+)
+
+foreach ($d in $DefFicha) {
+    $pnlHardware.Children.Add((New-FilaFicha -Etiqueta $d.E -Clave $d.C -Destacado $d.D)) | Out-Null
+}
+
+function Reset-Ficha {
+    foreach ($k in @($script:CamposFicha.Keys)) { $script:CamposFicha[$k].Text = '' }
+}
+
+function Mostrar-Ficha {
+    param($Info)
+    if (-not $Info) { return }
+    Set-Ficha 'fMarca'  ("{0} {1}" -f $Info.Marca, $Info.Modelo).Trim()
+    Set-Ficha 'fTipo'   $Info.Tipo_Equipo
+    Set-Ficha 'fCPU'    $Info.CPU_Modelo
+    Set-Ficha 'fCores'  ("{0} nucleos / {1} hilos · {2} GHz" -f $Info.CPU_Nucleos, $Info.CPU_Hilos, $Info.CPU_GHz).Trim(' ', '/', '·')
+    Set-Ficha 'fRAM'    ("{0} GB" -f $Info.RAM_Total_GB)
+    Set-Ficha 'fRAMTipo' ("{0} · {1}" -f $Info.RAM_Tipo, $Info.RAM_Velocidad_MHz).Trim(' ', '·')
+    Set-Ficha 'fRAMMod' $Info.RAM_Modulos
+    $SlotsTotal = 0
+    if ("$($Info.RAM_Slots)" -match '/(\d+)') { $SlotsTotal = [int]$Matches[1] }
+    $SlotsTxt = if ($SlotsTotal -gt 0) { "{0} libres de {1}" -f $Info.RAM_Slots_Libres, $SlotsTotal } else { "$($Info.RAM_Slots)" }
+    if ([int]$Info.RAM_Max_GB -gt 0) { $SlotsTxt = ("{0} · max {1} GB" -f $SlotsTxt, $Info.RAM_Max_GB) }
+    Set-Ficha 'fSlots' $SlotsTxt
+    Set-Ficha 'fDisco'  $Info.Disco_Modelo
+    Set-Ficha 'fDiscoTipo' ("{0} · {1} GB" -f $Info.Disco_Tipo, $Info.Disco_Capacidad_GB).Trim(' ', '·')
+    Set-Ficha 'fLibre'  ("{0} GB libres ({1}% usado)" -f $Info.Disco_Libre_GB, $Info.Disco_Uso_Pct)
+    Set-Ficha 'fSalud'  ("{0} {1}" -f $Info.Disco_Salud, $(if ($Info.Disco_Temperatura_C) { "· $($Info.Disco_Temperatura_C) C" } else { '' })).Trim()
+    Set-Ficha 'fBateria' $Info.Bateria_Estado
+    Set-Ficha 'fDesgaste' ("{0}% desgaste · {1} ciclos" -f $Info.Bateria_Desgaste_Pct, $Info.Bateria_Ciclos).Trim('%', ' ', '·')
+    Set-Ficha 'fSO'     $Info.SO_Nombre
+    Set-Ficha 'fBuild'  ("{0} (build {1})" -f $Info.SO_Version, $Info.SO_Build)
+    Set-Ficha 'fWinLic' $Info.Windows_Activado
+    Set-Ficha 'fOfficeLic' ("{0} {1}" -f $Info.Office_Activado, $Info.Office_Version).Trim()
+    Set-Ficha 'fDominio' $Info.Dominio_Grupo
+    Set-Ficha 'fRed'    ("{0} · {1}" -f $Info.IP, $Info.MAC).Trim(' ', '·')
+    Set-Ficha 'fTPM'    $Info.TPM
+    Set-Ficha 'fSB'     $Info.SecureBoot
+    Set-Ficha 'fSoftware' ("{0} programas" -f $Info.Software_Total)
+    Set-Ficha 'fArranque' $Info.Ultimo_Arranque
+    Update-EstadoSistema
+    Update-SoftwareInstalado
+}
+
+# =============================================================================
+#  PANEL DE ESTADO DEL SISTEMA (pestana SISTEMA)
+# =============================================================================
+$script:CamposEstado = New-Object System.Collections.Specialized.OrderedDictionary
+
+function New-FilaEstado {
+    param([string]$Etiqueta, [string]$Clave)
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = '0,0,0,6'
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition
+    $c1.Width = New-Object System.Windows.GridLength(138)
+    $c2 = New-Object System.Windows.Controls.ColumnDefinition
+    $c2.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+    $grid.ColumnDefinitions.Add($c1)
+    $grid.ColumnDefinitions.Add($c2)
+
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = $Etiqueta
+    $lbl.FontSize = 11
+    $lbl.Foreground = '#8494A6'
+    $lbl.TextWrapping = 'Wrap'
+    $lbl.VerticalAlignment = 'Top'
+    $lbl.Margin = '0,2,8,0'
+    [System.Windows.Controls.Grid]::SetColumn($lbl, 0)
+    $grid.Children.Add($lbl) | Out-Null
+
+    $val = New-Object System.Windows.Controls.TextBlock
+    $val.Text = '—'
+    $val.FontSize = 12
+    $val.TextWrapping = 'Wrap'
+    $val.Foreground = '#B8C6D4'
+    $val.VerticalAlignment = 'Top'
+    [System.Windows.Controls.Grid]::SetColumn($val, 1)
+    $grid.Children.Add($val) | Out-Null
+
+    $script:CamposEstado[$Clave] = $val
+    return $grid
+}
+
+$DefEstado = @(
+    [PSCustomObject]@{ E = 'Sistema operativo'; C = 'eSO' }
+    [PSCustomObject]@{ E = 'Version / build';   C = 'eBuild' }
+    [PSCustomObject]@{ E = 'Instalado';         C = 'eInstalado' }
+    [PSCustomObject]@{ E = 'Ultimo arranque';   C = 'eArranque' }
+    [PSCustomObject]@{ E = 'Uptime';            C = 'eUptime' }
+    [PSCustomObject]@{ E = 'Disco';             C = 'eDisco' }
+    [PSCustomObject]@{ E = 'Bateria';           C = 'eBateria' }
+)
+
+$DefSeguridad = @(
+    [PSCustomObject]@{ E = 'Windows';          C = 'eWin' }
+    [PSCustomObject]@{ E = 'Office';           C = 'eOffice' }
+    [PSCustomObject]@{ E = 'TPM';              C = 'eTPM' }
+    [PSCustomObject]@{ E = 'Secure Boot';      C = 'eSB' }
+    [PSCustomObject]@{ E = 'Antivirus';        C = 'eAV' }
+    [PSCustomObject]@{ E = 'Dominio / grupo';  C = 'eDominio' }
+    [PSCustomObject]@{ E = 'IP / MAC';         C = 'eRed' }
+)
+
+foreach ($d in $DefEstado) {
+    $pnlEstadoSistema.Children.Add((New-FilaEstado -Etiqueta $d.E -Clave $d.C)) | Out-Null
+}
+foreach ($d in $DefSeguridad) {
+    $pnlSeguridadSistema.Children.Add((New-FilaEstado -Etiqueta $d.E -Clave $d.C)) | Out-Null
+}
+
+function Set-EstadoCampo {
+    param([string]$Clave, [string]$Valor, [string]$Color = '')
+    if (-not $script:CamposEstado.Contains($Clave)) { return }
+    $tb = $script:CamposEstado[$Clave]
+    $tb.Text = if ([string]::IsNullOrWhiteSpace($Valor)) { '—' } else { $Valor }
+    $tb.Foreground = if ($Color) { $Color } else { '#B8C6D4' }
+}
+
+function Update-EstadoSistema {
+    if (-not $script:CamposEstado -or $script:CamposEstado.Count -eq 0) { return }
+
+    $i = $script:RegistroActual
+    if (-not $i) {
+        foreach ($k in @($script:CamposEstado.Keys)) { Set-EstadoCampo $k '—' }
+        Set-EstadoCampo 'eSO' 'Escanea un equipo para ver su estado'
+        return
+    }
+
+    Set-EstadoCampo 'eSO' $i.SO_Nombre
+
+    $build = @(
+        if ($i.SO_Version) { $i.SO_Version }
+        if ($i.SO_Build) { "build $($i.SO_Build)" }
+        if ($i.SO_Arquitectura) { $i.SO_Arquitectura }
+    ) -join ' · '
+    Set-EstadoCampo 'eBuild' $build
+
+    Set-EstadoCampo 'eInstalado' $i.SO_Instalado
+    Set-EstadoCampo 'eArranque' $i.Ultimo_Arranque
+    Set-EstadoCampo 'eUptime' $(if ($i.Uptime_Horas) { "$($i.Uptime_Horas) h" } else { '' })
+
+    $disco = @(
+        if ($i.Disco_Tipo) { $i.Disco_Tipo }
+        if ([int]$i.Disco_Capacidad_GB -gt 0) { "$($i.Disco_Capacidad_GB) GB" }
+        if ("$($i.Disco_Uso_Pct)" -ne '') { "$($i.Disco_Uso_Pct)% usado" }
+        if ($i.Disco_Salud) { $i.Disco_Salud }
+    ) -join ' · '
+    Set-EstadoCampo 'eDisco' $disco
+
+    if ($i.Bateria_Presente -eq 'Si') {
+        $bat = @(
+            if ($i.Bateria_Estado) { $i.Bateria_Estado }
+            if ("$($i.Bateria_Desgaste_Pct)" -ne '') { "$($i.Bateria_Desgaste_Pct)% desgaste" }
+            if ("$($i.Bateria_Ciclos)" -ne '') { "$($i.Bateria_Ciclos) ciclos" }
+        ) -join ' · '
+        Set-EstadoCampo 'eBateria' $bat
+    } elseif ($i.Bateria_Presente) {
+        Set-EstadoCampo 'eBateria' 'No presente'
+    }
+
+    $colorWin = if ($i.Windows_Activado -eq 'Activado') { '#B9F6CA' } else { '#FFB300' }
+    Set-EstadoCampo 'eWin' $i.Windows_Activado $colorWin
+
+    $officeTxt = (@($i.Office_Activado, $i.Office_Version) | Where-Object { $_ }) -join ' · '
+    $colorOffice = if ($i.Office_Activado -eq 'Activado') { '#B9F6CA' } else { '#FFB300' }
+    Set-EstadoCampo 'eOffice' $officeTxt $colorOffice
+
+    $colorTPM = if ($i.TPM -match 'Habilitado') { '#B9F6CA' } elseif ($i.TPM) { '#FFB300' } else { '' }
+    Set-EstadoCampo 'eTPM' $i.TPM $colorTPM
+
+    $colorSB = if ($i.SecureBoot -eq 'Activado') { '#B9F6CA' } elseif ($i.SecureBoot) { '#FFB300' } else { '' }
+    Set-EstadoCampo 'eSB' $i.SecureBoot $colorSB
+
+    Set-EstadoCampo 'eAV' $i.Antivirus
+    Set-EstadoCampo 'eDominio' $i.Dominio_Grupo
+    Set-EstadoCampo 'eRed' ((@($i.IP, $i.MAC) | Where-Object { $_ }) -join ' · ')
+}
+
+# =============================================================================
+#  SOFTWARE INSTALADO (pestana SOFTWARE)
+# =============================================================================
+function Update-SoftwareInstalado {
+    if (-not $txtSoftwareLista -or -not $txtSoftwareResumen) { return }
+    try {
+        $txtBuscarSoftwareHint.Visibility = if ([string]::IsNullOrEmpty($txtBuscarSoftware.Text)) { 'Visible' } else { 'Collapsed' }
+    } catch {}
+
+    $i = $script:RegistroActual
+    if (-not $i -or [string]::IsNullOrWhiteSpace($i.Software_Lista)) {
+        $txtSoftwareResumen.Text = 'sin datos'
+        $txtSoftwareLista.Text = 'Escanea un equipo para ver el software instalado.'
+        return
+    }
+
+    $texto = ''
+    try { $texto = ([string]$txtBuscarSoftware.Text).Trim().ToLower() } catch {}
+
+    $todos = @($i.Software_Lista -split '; ' | Where-Object { $_ })
+    $visibles = if ($texto) {
+        @($todos | Where-Object { $_.ToLower().Contains($texto) })
+    } else {
+        $todos
+    }
+
+    $txtSoftwareResumen.Text = if ($texto) {
+        '{0} de {1} programas' -f $visibles.Count, $todos.Count
+    } else {
+        '{0} programas' -f $todos.Count
+    }
+
+    $txtSoftwareLista.Text = if ($visibles.Count -gt 0) {
+        $visibles -join "`r`n"
+    } else {
+        'Sin coincidencias.'
+    }
+
+    try { $txtSoftwareLista.ScrollToHome() } catch {}
+}
+
+function Select-Tab {
+    param([string]$Nombre)
+    try {
+        foreach ($it in $tabs.Items) {
+            if ([string]$it.Header -eq $Nombre) { $tabs.SelectedItem = $it; return }
+        }
+    } catch {}
+}
+
+# =============================================================================
+#  ESTADO DE LA SESION
+# =============================================================================
+$script:RegistroActual = $null
+$script:ContadorSesion = 0
+
+function Update-Contadores {
+    $txtContador.Text = '{0} equipo{1}' -f $script:ContadorSesion, $(if ($script:ContadorSesion -eq 1) { '' } else { 's' })
+    $pend = 0
+    try { $pend = @(Get-ChildItem -Path $script:QueueDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count } catch {}
+    $txtPendientes.Text = if ($pend -gt 0) { "· $pend pendiente(s) de sincronizar" } else { '' }
+}
+
+function Get-HojaActual {
+    $cliente = $txtCliente.Text.Trim()
+    $nombre = if ([string]::IsNullOrWhiteSpace($cliente)) { 'Sin cliente' } else { $cliente }
+    return ('{0} · {1}' -f (Get-Date -Format 'yyyy-MM-dd'), $nombre)
+}
+
+# =============================================================================
+#  ESCANEO
+# =============================================================================
+function Start-Escaneo {
+    if ($script:TareasActivas -gt 0) {
+        Set-Estado 'Espera a que termine la tarea en curso...' 'warn'
+        return
+    }
+    Set-Estado 'Escaneando hardware...' 'info'
+    $txtScanEstado.Text = 'escaneando...'
+    Reset-Ficha
+
+    Start-Tarea -Script {
+        param($corePath)
+        . $corePath
+        Get-InventoryRecord -IncludeSoftware $true
+    } -Argumentos @($script:CorePath) -OnDone {
+        param($resultado, $errorTxt)
+        if ($errorTxt -or -not $resultado) {
+            Set-Estado 'No se pudo leer el hardware. Ejecuta como administrador.' 'error'
+            $txtScanEstado.Text = 'error'
+            Write-Log "Escaneo fallido: $errorTxt" 'ERROR'
+            return
+        }
+        $script:RegistroActual = $resultado
+        $txtSerial.Text = $resultado.Serial
+        $txtMarca.Text = $resultado.Marca
+        $txtModelo.Text = $resultado.Modelo
+        Mostrar-Ficha $resultado
+        $txtScanEstado.Text = ('{0} · escaneado {1}' -f $resultado.Tipo_Equipo, (Get-Date -Format 'HH:mm:ss'))
+        Set-Estado ('Equipo detectado: {0} {1}' -f $resultado.Marca, $resultado.Modelo) 'ok'
+        Write-Log ('Escaneo OK: {0} {1} / {2}' -f $resultado.Marca, $resultado.Modelo, $resultado.Serial)
+        $txtComentario.Focus() | Out-Null
+    }
+}
+
+# =============================================================================
+#  GUARDAR
+# =============================================================================
+function Guardar-Registro {
+    param([bool]$Siguiente = $false)
+
+    $serial = $txtSerial.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($serial) -or $serial.Length -lt 3) {
+        Set-Estado 'Serial obligatorio: escanea el equipo o escribelo a mano.' 'warn'
+        $txtSerial.Focus() | Out-Null
+        return $false
+    }
+
+    $cliente = $txtCliente.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($cliente)) {
+        Set-Estado 'Escribe el nombre del cliente antes de guardar.' 'warn'
+        $txtCliente.Focus() | Out-Null
+        return $false
+    }
+
+    # Construir registro: base escaneada + datos del formulario
+    $reg = [ordered]@{}
+    foreach ($c in $script:Columnas) {
+        $reg[$c] = if ($script:RegistroActual -and $null -ne $script:RegistroActual.$c) { [string]$script:RegistroActual.$c } else { '' }
+    }
+
+    $reg['Cliente'] = $cliente
+    if (-not $script:Config['Cliente']) { $script:Config['Cliente'] = $cliente; Save-Config }
+    $reg['Sede_Tecnico'] = $txtSede.Text.Trim()
+    $reg['Orden'] = $txtOrden.Text.Trim()
+    $reg['Comentarios'] = ($txtComentario.Text -replace '[\r\n]+', ' ').Trim()
+    if ($txtSerial.Text.Trim()) { $reg['Serial'] = $txtSerial.Text.Trim() }
+    if ($txtMarca.Text.Trim()) { $reg['Marca'] = $txtMarca.Text.Trim() }
+    if ($txtModelo.Text.Trim()) { $reg['Modelo'] = $txtModelo.Text.Trim() }
+
+    $objeto = [PSCustomObject]$reg
+
+    try {
+        $csv = Save-RecordCsv -Registro $objeto -DataDir $script:DataDir -Cliente $cliente
+        Write-Log "Registro guardado en: $(Split-Path $csv -Leaf)"
+    } catch {
+        Set-Estado "No se pudo escribir el CSV: $($_.Exception.Message)" 'error'
+        Write-Log "Error guardando CSV: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    # Cola de sincronizacion
+    $archivoCola = $null
+    try {
+        $archivoCola = Save-PendingRecord -Registro $objeto -QueueDir $script:QueueDir -Hoja (Get-HojaActual)
+        Write-Log 'Registro en cola para Google Sheets.'
+    } catch {
+        Write-Log "No se pudo encolar: $($_.Exception.Message)" 'WARN'
+    }
+
+    $script:ContadorSesion++
+    Update-Contadores
+
+    # Sincronizar en segundo plano si esta configurado
+    if ($script:Config['SincronizarAlGuardar'] -and $script:Config['WebhookUrl']) {
+        Start-Sincronizacion -Silencioso $true
+    }
+
+    Set-Estado ("Guardado: {0} ({1})" -f $serial, $cliente) 'ok'
+
+    if ($Siguiente) {
+        $script:RegistroActual = $null
+        $txtSerial.Text = ''
+        $txtMarca.Text = ''
+        $txtModelo.Text = ''
+        $txtComentario.Text = ''
+        Reset-Ficha
+        Update-EstadoSistema
+        Update-SoftwareInstalado
+        $txtScanEstado.Text = 'sin escanear'
+        Start-Escaneo
+    }
+
+    return $true
+}
+
+# =============================================================================
+#  SINCRONIZACION
+# =============================================================================
+function Start-Sincronizacion {
+    param([bool]$Silencioso = $false)
+
+    $url = $script:Config['WebhookUrl']
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        if (-not $Silencioso) {
+            Set-Estado 'Falta configurar WebhookUrl en config.json' 'warn'
+            [System.Windows.Forms.MessageBox]::Show(
+                "Para enviar a Google Sheets configura la URL del Web App en:`n`n$script:ConfigPath`n`nCampo: WebhookUrl",
+                'Google Sheets', 'OK', 'Information')
+        }
+        return
+    }
+
+    if (-not $Silencioso) { Set-Estado 'Sincronizando con Google Sheets...' 'info' }
+
+    # El callback se ejecuta despues; se usa una variable de script para el modo silencioso
+    $script:SyncSilencioso = $Silencioso
+
+    Start-Tarea -Script {
+        param($queueDir, $url, $token, $corePath)
+        . $corePath
+        Sync-PendingQueue -QueueDir $queueDir -WebhookUrl $url -Token $token
+    } -Argumentos @($script:QueueDir, $url, $script:Config['Token'], $script:CorePath) -OnDone {
+        param($resultado, $errorTxt)
+        Update-Contadores
+        if ($errorTxt) {
+            Write-Log "Sincronizacion fallida: $errorTxt" 'WARN'
+            if (-not $script:SyncSilencioso) { Set-Estado 'No se pudo sincronizar. Se reintentara despues.' 'warn' }
+            return
+        }
+        $enviados = if ($resultado) { $resultado.Enviados } else { 0 }
+        $pendientes = if ($resultado) { $resultado.Pendientes } else { 0 }
+        if ($enviados -gt 0) {
+            Write-Log ("Sincronizados {0} registro(s). Pendientes: {1}" -f $enviados, $pendientes)
+            Set-Estado ("Sincronizados {0} registro(s) con Google Sheets" -f $enviados) 'ok'
+        } elseif ($pendientes -gt 0) {
+            Set-Estado ("{0} registro(s) esperando conexion" -f $pendientes) 'warn'
+        } elseif (-not $script:SyncSilencioso) {
+            Set-Estado 'Todo sincronizado' 'ok'
+        }
+    }
+}
+
+# =============================================================================
+#  ACCIONES DE SISTEMA
+# =============================================================================
+function Show-Mensaje {
+    param([string]$Texto, [string]$Titulo = 'Wiggles Mini', [string]$Icono = 'Information')
+    [System.Windows.Forms.MessageBox]::Show($Texto, $Titulo, 'OK', $Icono) | Out-Null
+}
+
+function Show-Texto {
+    param([string]$Titulo, [string]$Contenido)
+    $w = New-Object System.Windows.Window
+    $w.Title = $Titulo
+    $w.Width = 780; $w.Height = 560
+    $w.WindowStartupLocation = 'CenterOwner'
+    $w.Owner = $Window
+    $w.Background = '#0B0F14'
+    $w.Foreground = '#E6EDF3'
+    $dock = New-Object System.Windows.Controls.DockPanel
+    $dock.Margin = '10'
+
+    $tb = New-Object System.Windows.Controls.TextBox
+    $tb.Text = $Contenido
+    $tb.IsReadOnly = $true
+    $tb.TextWrapping = 'NoWrap'
+    $tb.AcceptsReturn = $true
+    $tb.VerticalScrollBarVisibility = 'Auto'
+    $tb.HorizontalScrollBarVisibility = 'Auto'
+    $tb.Background = '#0F1520'
+    $tb.Foreground = '#B9F6CA'
+    $tb.BorderBrush = '#1E2A38'
+    $tb.FontFamily = 'Consolas'
+    $tb.FontSize = 12
+    $tb.Padding = '10'
+    [System.Windows.Controls.DockPanel]::SetDock($tb, 'Top')
+
+    $btn = New-Object System.Windows.Controls.Button
+    $btn.Content = 'Cerrar'
+    $btn.Width = 110
+    $btn.Height = 32
+    $btn.Margin = '0,10,0,0'
+    $btn.Style = $Window.FindResource('BotonVerde')
+    $btn.Add_Click({ $w.Close() })
+    [System.Windows.Controls.DockPanel]::SetDock($btn, 'Bottom')
+
+    $dock.Children.Add($tb) | Out-Null
+    $dock.Children.Add($btn) | Out-Null
+    $w.Content = $dock
+    $w.ShowDialog() | Out-Null
+}
+
+function Ejecutar-Oculto {
+    param([string]$Archivo, [string]$Argumentos, [string]$Descripcion)
+    Write-Log "Ejecutando: $Descripcion"
+    try {
+        Start-Process -FilePath $Archivo -ArgumentList $Argumentos -NoNewWindow -Wait
+        Write-Log "Finalizado: $Descripcion"
+    } catch {
+        Write-Log "Fallo $Descripcion : $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Start-CambioEdicion {
+    $os = Get-CimInstance Win32_OperatingSystem
+    if ($os.Caption -notmatch 'Home|Core|Single') {
+        Show-Mensaje "Este equipo ya es $($os.Caption).`nNo requiere cambio de edicion." 'Cambiar edicion'
+        return
+    }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Se cambiara la edicion de:`n`n$($os.Caption)`n`nA: Windows Pro`n`nEl equipo se reiniciara y la activacion quedara pendiente hasta activar.`n`n¿Continuar?",
+        'Cambiar edicion', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Write-Log 'Iniciando cambio de edicion a Pro...'
+    Set-Estado 'Cambiando edicion de Windows...' 'info'
+    Start-Tarea -Script {
+        try {
+            $clave = 'VK7JG-NPHTM-C97JM-9MPGT-3V66T'
+            $p = Start-Process -FilePath 'changepk.exe' -ArgumentList "/productkey $clave" -PassThru -Wait
+            return "Codigo: $($p.ExitCode)"
+        } catch { return "Error: $($_.Exception.Message)" }
+    } -OnDone {
+        param($resultado, $errorTxt)
+        Set-Estado "Cambio de edicion: $resultado" 'ok'
+        Write-Log "Cambio de edicion: $resultado"
+        Show-Mensaje "Proceso finalizado ($resultado).`n`nReinicia el equipo para completar el cambio a Windows Pro." 'Cambiar edicion'
+    }
+}
+
+function Start-Bloatware {
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Se eliminaran aplicaciones preinstaladas de Windows (juegos, redes sociales, apps de terceros de la Store).`n`nNo se tocan Calculadora, Fotos, Tienda ni Notas.`n`n¿Continuar?",
+        'Eliminar bloatware', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Set-Estado 'Eliminando bloatware...' 'info'
+    Start-Tarea -Script {
+        $patrones = @(
+            '*CandyCrush*', '*BubbleWitch*', '*Netflix*', '*Spotify*', '*TikTok*', '*Facebook*',
+            '*Instagram*', '*Disney*', '*Twitter*', '*LinkedIn*', '*Pandora*', '*Duolingo*',
+            '*HiddenCity*', '*Roblox*', '*MarchofEmpires*', '*XboxApp*', '*XboxGameOverlay*',
+            '*XboxGamingOverlay*', '*XboxIdentityProvider*', '*XboxSpeechToTextOverlay*',
+            '*Microsoft3DViewer*', '*WindowsMaps*', '*WindowsFeedbackHub*', '*GetHelp*',
+            '*GetStarted*', '*MicrosoftSolitaire*', '*BingNews*', '*BingWeather*', '*BingSports*',
+            '*BingFinance*', '*ZuneMusic*', '*ZuneVideo*', '*SkypeApp*', '*OfficeHub*',
+            '*OneNote*', '*People*', '*YourPhone*', '*MixedReality*', '*3DPrint*'
+        )
+        $eliminados = 0
+        foreach ($p in $patrones) {
+            Get-AppxPackage -Name $p -AllUsers -ErrorAction SilentlyContinue | ForEach-Object {
+                try { Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction Stop; $eliminados++ } catch {}
+            }
+            Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like $p } |
+                ForEach-Object {
+                    try { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop | Out-Null } catch {}
+                }
+        }
+        return $eliminados
+    } -OnDone {
+        param($resultado, $errorTxt)
+        Set-Estado ("Bloatware eliminado ({0} paquetes)" -f $resultado) 'ok'
+        Write-Log ("Bloatware: {0} paquetes eliminados" -f $resultado)
+    }
+}
+
+function Start-Rendimiento {
+    Set-Estado 'Configurando plan de rendimiento...' 'info'
+    try {
+        powercfg /setactive SCHEME_MIN 2>$null
+        $activo = (powercfg /getactivescheme) -join ' '
+        if ($activo -notmatch 'e9a42b02|8c5e7fda') {
+            powercfg -duplicate-scheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>$null | Out-Null
+        }
+        powercfg /change standby-timeout-ac 0
+        powercfg /change monitor-timeout-ac 20
+        Set-Estado 'Plan de maximo rendimiento aplicado' 'ok'
+        Write-Log 'Plan de rendimiento configurado.'
+    } catch {
+        Set-Estado 'No se pudo cambiar el plan de energia' 'warn'
+    }
+}
+
+function Start-PuntoRestauracion {
+    Set-Estado 'Creando punto de restauracion...' 'info'
+    Start-Tarea -Script {
+        try {
+            Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+            Checkpoint-Computer -Description 'Wiggles Mini' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+            return 'OK'
+        } catch { return "Error: $($_.Exception.Message)" }
+    } -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado -eq 'OK') {
+            Set-Estado 'Punto de restauracion creado' 'ok'
+            Write-Log 'Punto de restauracion creado.'
+        } else {
+            Set-Estado 'No se pudo crear el punto (revisa Proteccion del sistema)' 'warn'
+            Write-Log "Punto de restauracion: $resultado" 'WARN'
+        }
+    }
+}
+
+function Start-AdminLocal {
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    $usuario = [Microsoft.VisualBasic.Interaction]::InputBox('Nombre del nuevo usuario administrador:', 'Crear administrador local', 'Soporte360')
+    if ([string]::IsNullOrWhiteSpace($usuario)) { return }
+    $clave = [Microsoft.VisualBasic.Interaction]::InputBox('Contrasena (puede dejarla vacia):', 'Crear administrador local', '')
+    try {
+        if (Get-LocalUser -Name $usuario -ErrorAction SilentlyContinue) {
+            Show-Mensaje "El usuario '$usuario' ya existe." 'Crear administrador'
+            return
+        }
+        if ([string]::IsNullOrEmpty($clave)) {
+            New-LocalUser -Name $usuario -NoPassword -PasswordNeverExpires -ErrorAction Stop | Out-Null
+        } else {
+            $segura = ConvertTo-SecureString $clave -AsPlainText -Force
+            New-LocalUser -Name $usuario -Password $segura -PasswordNeverExpires -ErrorAction Stop | Out-Null
+        }
+        # SID bien conocido: funciona en Windows en cualquier idioma
+        $grupoAdmin = Get-LocalGroup -SID 'S-1-5-32-544' -ErrorAction Stop
+        Add-LocalGroupMember -Group $grupoAdmin -Member $usuario -ErrorAction Stop
+        Set-Estado "Usuario '$usuario' creado como administrador" 'ok'
+        Write-Log "Usuario local creado: $usuario"
+    } catch {
+        Set-Estado "No se pudo crear el usuario: $($_.Exception.Message)" 'error'
+        Write-Log "Crear admin local: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Show-ClaveBios {
+    $clave = ''
+    try { $clave = (Get-CimInstance SoftwareLicensingService).OA3xOriginalProductKey } catch {}
+    if (-not $clave) {
+        try { $clave = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SoftwareProtectionPlatform').BackupProductKeyDefault } catch {}
+    }
+    if (-not $clave) { $clave = 'No hay clave embebida en la BIOS (equipo con licencia digital o sin OEM key).' }
+    Show-Texto -Titulo 'Clave de Windows' -Contenido ("Clave OEM (BIOS):`n`n  $clave`n`nY recuerda: la licencia digital queda vinculada al hardware del equipo.")
+}
+
+function Show-ResumenEquipo {
+    if (-not $script:RegistroActual) {
+        Show-Mensaje 'Primero escanea un equipo.' 'Resumen'
+        return
+    }
+    $lineas = @()
+    $lineas += 'FICHA DEL EQUIPO'
+    $lineas += ('=' * 78)
+    foreach ($c in $script:Columnas) {
+        $v = $script:RegistroActual.$c
+        if ([string]::IsNullOrWhiteSpace($v)) { continue }
+        if ($c -eq 'Software_Lista') { $v = 'ver detalle abajo' }
+        $lineas += ('{0,-24} {1}' -f ($c + ':'), $v)
+    }
+    if ($script:RegistroActual.Software_Lista) {
+        $lineas += ''
+        $lineas += 'SOFTWARE INSTALADO'
+        $lineas += ('=' * 78)
+        $lineas += ($script:RegistroActual.Software_Lista -replace '; ', "`n")
+    }
+    Show-Texto -Titulo 'Resumen del equipo' -Contenido ($lineas -join "`r`n")
+}
+
+function Start-ReporteBateria {
+    Set-Estado 'Generando reporte de bateria...' 'info'
+    $destino = Join-Path $script:DataDir ('Bateria_{0}_{1}.html' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    try {
+        powercfg /batteryreport /OUTPUT "$destino" | Out-Null
+        if (Test-Path $destino) {
+            Set-Estado 'Reporte de bateria generado' 'ok'
+            Write-Log "Reporte de bateria: $destino"
+            Start-Process $destino
+        } else {
+            Set-Estado 'No se pudo generar el reporte (equipo sin bateria)' 'warn'
+        }
+    } catch {
+        Set-Estado 'No se pudo generar el reporte de bateria' 'error'
+    }
+}
+
+# =============================================================================
+#  OFFICE
+# =============================================================================
+function Get-EstadoOffice {
+    $setup = Join-Path $script:OfficeDir 'Setup.exe'
+    $config = Join-Path $script:OfficeDir 'Configuration.xml'
+
+    if ((Test-Path $setup) -and (Test-Path $config)) {
+        return [PSCustomObject]@{ Listo = $true; Texto = 'Listo para instalar Office 2024 desde internet (~2 GB).' }
+    }
+    return [PSCustomObject]@{ Listo = $false; Texto = 'Faltan Setup.exe o Configuration.xml en External\Office.' }
+}
+
+function Start-InstalarOffice {
+    $setup = Join-Path $script:OfficeDir 'Setup.exe'
+    $config = Join-Path $script:OfficeDir 'Configuration.xml'
+
+    if (-not ((Test-Path $setup) -and (Test-Path $config))) {
+        Set-Estado 'Faltan Setup.exe o Configuration.xml en External\Office' 'error'
+        return
+    }
+
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Office 2024 se descargara de internet (~2 GB) y puede tardar bastante segun la conexion.`n`n¿Continuar?",
+        'Instalar Office', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Set-Estado 'Instalando Office 2024...' 'info'
+    Start-Tarea -Script {
+        param($officeDir)
+
+        $setup = Join-Path $officeDir 'Setup.exe'
+        $config = Join-Path $officeDir 'Configuration.xml'
+        if (-not (Test-Path $setup)) { return 'Falta Setup.exe del Office Deployment Tool en External\Office' }
+        if (-not (Test-Path $config)) { return 'Falta Configuration.xml en External\Office' }
+
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+        # ODT descarga el paquete y lo instala en la misma pasada
+        $p = Start-Process -FilePath $setup -ArgumentList "/configure `"$config`"" -Wait -PassThru -WindowStyle Hidden
+        return [string]$p.ExitCode
+    } -Argumentos @($script:OfficeDir) -OnDone {
+        param($resultado, $errorTxt)
+        if ($errorTxt) {
+            Set-Estado 'Fallo la instalacion de Office' 'error'
+            Write-Log "Office: $errorTxt" 'ERROR'
+            return
+        }
+        if ($resultado -eq '0') {
+            Set-Estado 'Office instalado correctamente' 'ok'
+            Write-Log 'Office 2024 instalado.'
+        } elseif ($resultado -match '^Falta') {
+            Set-Estado $resultado 'error'
+            Write-Log $resultado 'ERROR'
+        } else {
+            Set-Estado "Office finalizo con codigo $resultado" 'warn'
+            Write-Log "Office exit code: $resultado" 'WARN'
+        }
+        Actualizar-EstadoOffice
+    }
+}
+
+function Actualizar-EstadoOffice {
+    $e = Get-EstadoOffice
+    $txtOfficeEstado.Text = $e.Texto
+    $txtOfficeEstado.Foreground = if ($e.Listo) { '#B9F6CA' } else { '#FFB300' }
+}
+
+function Start-QuitarOffice {
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Se desinstalara cualquier version de Office instalada (Click-to-Run).`n`n¿Continuar?",
+        'Desinstalar Office', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+    Set-Estado 'Desinstalando Office...' 'info'
+    Start-Tarea -Script {
+        $setup = Join-Path $env:ProgramFiles 'Common Files\microsoft shared\ClickToRun\OfficeClickToRun.exe'
+        if (-not (Test-Path $setup)) {
+            $setup = Join-Path ${env:ProgramFiles(x86)} 'Common Files\microsoft shared\ClickToRun\OfficeClickToRun.exe'
+        }
+        if (-not (Test-Path $setup)) { return 'No se encontro Office Click-to-Run instalado.' }
+        $p = Start-Process -FilePath $setup -ArgumentList 'scenario=install scenario=uninstall' -Wait -PassThru
+        return "Desinstalacion finalizada (codigo $($p.ExitCode))."
+    } -OnDone {
+        param($resultado, $errorTxt)
+        Set-Estado 'Proceso de desinstalacion terminado' 'ok'
+        Write-Log "Quitar Office: $resultado"
+    }
+}
+
+# =============================================================================
+#  SOFTWARE
+# =============================================================================
+function Update-ResumenApps {
+    $sel = @($script:AppsCatalogo | Where-Object { $_.Seleccionada }).Count
+    try {
+        $palabra = if ($sel -eq 1) { 'seleccionada' } else { 'seleccionadas' }
+        $txtAppsResumen.Text = "{0} aplicaciones · {1} {2}" -f $script:AppsCatalogo.Count, $sel, $palabra
+    } catch {}
+}
+
+function Update-ListaApps {
+    if (-not $pnlApps) { return }
+
+    $texto = ''
+    try { $texto = ([string]$txtBuscarApp.Text).Trim().ToLower() } catch {}
+    try { $txtBuscarHint.Visibility = if ([string]::IsNullOrEmpty($txtBuscarApp.Text)) { 'Visible' } else { 'Collapsed' } } catch {}
+
+    $cat = 'Todas'
+    try { if ($cmbCategoriaApp.SelectedItem) { $cat = [string]$cmbCategoriaApp.SelectedItem } } catch {}
+
+    $pnlApps.Children.Clear()
+    $mostradas = 0
+
+    foreach ($app in @($script:AppsCatalogo)) {
+        if ($cat -ne 'Todas' -and $app.Categoria -ne $cat) { continue }
+
+        if ($texto) {
+            $buscable = ("{0} {1} {2}" -f $app.Nombre, $app.Descripcion, $app.Id).ToLower()
+            if (-not $buscable.Contains($texto)) { continue }
+        }
+
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Margin = '8,4,8,4'
+        $cb.Tag = $app
+        $cb.IsChecked = [bool]$app.Seleccionada
+        $cb.ToolTip = $app.Id
+        if ($app.Recomendada) { $cb.FontWeight = 'SemiBold' }
+
+        $linea = New-Object System.Windows.Controls.TextBlock
+        $linea.TextWrapping = 'Wrap'
+        if ($app.Recomendada) {
+            $linea.Text = "★ {0} — {1}" -f $app.Nombre, $app.Descripcion
+            $linea.Foreground = '#E6EDF3'
+        } else {
+            $linea.Text = "{0} — {1}" -f $app.Nombre, $app.Descripcion
+            $linea.Foreground = '#B8C6D4'
+        }
+        $cb.Content = $linea
+        $cb.Add_Click({
+            $this.Tag.Seleccionada = [bool]$this.IsChecked
+            Update-ResumenApps
+        })
+
+        $pnlApps.Children.Add($cb) | Out-Null
+        $mostradas++
+    }
+
+    if ($mostradas -eq 0) {
+        $vacio = New-Object System.Windows.Controls.TextBlock
+        $vacio.Text = 'No hay aplicaciones que coincidan con la busqueda.'
+        $vacio.Foreground = '#8494A6'
+        $vacio.Margin = '12,12,12,12'
+        $pnlApps.Children.Add($vacio) | Out-Null
+    }
+
+    Update-ResumenApps
+}
+
+function Inicializar-CatalogoApps {
+    try {
+        $cats = @('Todas') + @($script:AppsCatalogo | ForEach-Object { $_.Categoria } | Sort-Object -Unique)
+        $cmbCategoriaApp.ItemsSource = $cats
+        $cmbCategoriaApp.SelectedIndex = 0
+    } catch {}
+    Update-ListaApps
+}
+
+function Start-InstalarSeleccionadas {
+    $sel = @($script:AppsCatalogo | Where-Object { $_.Seleccionada })
+    if ($sel.Count -eq 0) {
+        Show-Mensaje 'Marca al menos una aplicacion de la lista.' 'Aplicaciones'
+        return
+    }
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Show-Mensaje 'Winget no esta disponible en este equipo. Usa "Reparar winget" primero.' 'Aplicaciones' 'Warning'
+        return
+    }
+
+    $nombres = @($sel | Select-Object -First 12 | ForEach-Object { $_.Nombre })
+    $detalle = $nombres -join "`n"
+    if ($sel.Count -gt 12) { $detalle += "`n... y $($sel.Count - 12) mas" }
+
+    $resp = [System.Windows.MessageBox]::Show(
+        "Se instalaran $($sel.Count) aplicaciones:`n`n$detalle`n`n¿Continuar?",
+        'Instalar aplicaciones', 'YesNo', 'Question')
+    if ($resp -ne 'Yes') { return }
+
+    Set-Estado ("Instalando {0} aplicaciones..." -f $sel.Count) 'info'
+    $txtAppsEstado.Text = 'Instalando. Esto puede tardar varios minutos...'
+    Write-Log ("Instalar apps: " + (($sel | ForEach-Object { $_.Id }) -join ', '))
+
+    $paquete = [PSCustomObject]@{ Apps = $sel; Log = $script:LogFile }
+
+    Start-Tarea -Script {
+        param($paquete)
+        $ok = 0
+        $fallidos = @()
+
+        foreach ($a in $paquete.Apps) {
+            $estado = 'ERROR'
+            try {
+                $id = [string]$a.Id
+                $source = 'winget'
+                if ($id.StartsWith('msstore:')) {
+                    $source = 'msstore'
+                    $id = $id.Substring(8)
+                }
+                $p = Start-Process -FilePath 'winget' -ArgumentList @(
+                    'install', '--id', $id, '-e', '--source', $source, '--silent',
+                    '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'
+                ) -Wait -PassThru -WindowStyle Hidden
+
+                if ($p.ExitCode -eq 0 -or $p.ExitCode -eq -1978335189 -or $p.ExitCode -eq -1978335135) {
+                    $ok++
+                    $estado = 'OK'
+                } else {
+                    $fallidos += $a.Nombre
+                    $estado = "ERROR $($p.ExitCode)"
+                }
+            } catch {
+                $fallidos += $a.Nombre
+                $estado = "ERROR $($_.Exception.Message)"
+            }
+
+            try {
+                Add-Content -Path $paquete.Log -Encoding UTF8 -Value (
+                    '{0} [APP] {1} -> {2}' -f (Get-Date -Format 'HH:mm:ss'), $a.Id, $estado)
+            } catch {}
+        }
+
+        return [PSCustomObject]@{ Ok = $ok; Fallidos = @($fallidos) }
+    } -Argumentos @(, $paquete) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            $fallidos = @($resultado.Fallidos)
+            if ($fallidos.Count -eq 0) {
+                $msg = "Aplicaciones instaladas: $($resultado.Ok)"
+                Set-Estado $msg 'ok'
+                $txtAppsEstado.Text = $msg
+            } else {
+                $msg = "Instaladas: $($resultado.Ok) · fallidas: $($fallidos.Count)"
+                Set-Estado $msg 'warn'
+                $txtAppsEstado.Text = $msg + ': ' + ($fallidos -join ', ')
+            }
+            Write-Log $msg
+        } else {
+            Set-Estado 'No se pudieron instalar las aplicaciones' 'error'
+            $txtAppsEstado.Text = "Error: $errorTxt"
+            Write-Log "Apps: $errorTxt" 'ERROR'
+        }
+    }
+}
+
+function Start-AppsBasicas {
+    $lista = @($script:Config['AppsBasicas'])
+    if ($lista.Count -eq 0) { Show-Mensaje 'No hay aplicaciones configuradas en config.json' 'Aplicaciones'; return }
+
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Show-Mensaje 'Winget no esta disponible en este equipo. Usa "Reparar winget" primero.' 'Aplicaciones' 'Warning'
+        return
+    }
+
+    Set-Estado 'Instalando aplicaciones basicas...' 'info'
+    Write-Log ("Instalando: " + ($lista -join ', '))
+    Start-Tarea -Script {
+        param($ids)
+        $ok = 0; $fail = 0
+        foreach ($id in $ids) {
+            try {
+                $appId = [string]$id
+                $source = 'winget'
+                if ($appId.StartsWith('msstore:')) {
+                    $source = 'msstore'
+                    $appId = $appId.Substring(8)
+                }
+                $p = Start-Process -FilePath 'winget' -ArgumentList @(
+                    'install', '--id', $appId, '-e', '--source', $source, '--silent',
+                    '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'
+                ) -Wait -PassThru -WindowStyle Hidden
+                if ($p.ExitCode -eq 0 -or $p.ExitCode -eq -1978335135) { $ok++ } else { $fail++ }
+            } catch { $fail++ }
+        }
+        return [PSCustomObject]@{ Ok = $ok; Fallidos = $fail }
+    } -Argumentos @(, $lista) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            Set-Estado ("Aplicaciones instaladas: {0} · fallidas: {1}" -f $resultado.Ok, $resultado.Fallidos) 'ok'
+            Write-Log ("Apps basicas: {0} OK / {1} fallidas" -f $resultado.Ok, $resultado.Fallidos)
+        } else {
+            Set-Estado 'No se pudieron instalar las aplicaciones' 'error'
+        }
+    }
+}
+
+function Start-Runtimes {
+    Set-Estado 'Instalando runtimes...' 'info'
+    Start-Tarea -Script {
+        $ids = @(
+            'Microsoft.VCRedist.2015+.x64',
+            'Microsoft.VCRedist.2015+.x86',
+            'Microsoft.DotNet.DesktopRuntime.8'
+        )
+        foreach ($id in $ids) {
+            try {
+                Start-Process -FilePath 'winget' -ArgumentList @(
+                    'install', '--id', $id, '-e', '--silent',
+                    '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'
+                ) -Wait -WindowStyle Hidden
+            } catch {}
+        }
+        return 'OK'
+    } -OnDone {
+        param($resultado, $errorTxt)
+        Set-Estado 'Runtimes procesados' 'ok'
+    }
+}
+
+function Start-RepararWinget {
+    Set-Estado 'Reparando winget...' 'info'
+    Start-Tarea -Script {
+        try {
+            $destino = Join-Path $env:TEMP 'winget.msixbundle'
+            Invoke-WebRequest -Uri 'https://aka.ms/getwinget' -OutFile $destino -UseBasicParsing -TimeoutSec 180
+            Add-AppxPackage -Path $destino -ErrorAction Stop
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+            Start-Process -FilePath 'winget' -ArgumentList 'source update --accept-source-agreements --disable-interactivity' -Wait -WindowStyle Hidden
+            return 'OK'
+        } catch { return "Error: $($_.Exception.Message)" }
+    } -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado -eq 'OK') {
+            Set-Estado 'Winget reparado' 'ok'
+            Write-Log 'Winget reparado.'
+        } else {
+            Set-Estado 'No se pudo reparar winget' 'error'
+            Write-Log "Winget: $resultado" 'ERROR'
+        }
+    }
+}
+
+# =============================================================================
+#  AJUSTES PORTADOS DE WINUTIL (MIT)
+# =============================================================================
+$script:WinFeatures = @(
+    [PSCustomObject]@{ Id='DotNet'; Nombre='.NET Framework 2/3/4'; Features=@('NetFx3','NetFx4-AdvSrvs'); Descripcion='Habilita .NET Framework 2, 3 y 4 para aplicaciones antiguas.' }
+    [PSCustomObject]@{ Id='HyperV'; Nombre='Hyper-V'; Features=@('Microsoft-Hyper-V-All'); Descripcion='Virtualizacion de Hyper-V. No disponible en Windows Home.' }
+    [PSCustomObject]@{ Id='WSL'; Nombre='WSL (Linux)'; Features=@('Microsoft-Windows-Subsystem-Linux','VirtualMachinePlatform'); Descripcion='Subsistema de Windows para Linux y plataforma de maquinas virtuales.' }
+    [PSCustomObject]@{ Id='Sandbox'; Nombre='Windows Sandbox'; Features=@('Containers-DisposableClientVM'); Descripcion='Escritorio aislado para probar programas. No disponible en Windows Home.' }
+    [PSCustomObject]@{ Id='NFS'; Nombre='Cliente NFS'; Features=@('ServicesForNFS-ClientOnly','ClientForNFS-Infrastructure','NFS-Administration'); Descripcion='Acceso a recursos compartidos NFS.' }
+    [PSCustomObject]@{ Id='LegacyMedia'; Nombre='Reproductor y DirectPlay'; Features=@('WindowsMediaPlayer','MediaPlayback','DirectPlay','LegacyComponents'); Descripcion='Componentes multimedia y juegos antiguos.' }
+    [PSCustomObject]@{ Id='OpenSSH'; Nombre='Servidor OpenSSH'; Features=@('OpenSSH-Server'); Descripcion='Permite conexiones SSH al equipo.' }
+)
+
+$script:PanelesClasicos = @(
+    [PSCustomObject]@{ Nombre='Administracion de equipos'; Exe='compmgmt.msc'; Args='' }
+    [PSCustomObject]@{ Nombre='Administracion de discos'; Exe='diskmgmt.msc'; Args='' }
+    [PSCustomObject]@{ Nombre='Panel de control'; Exe='control.exe'; Args='' }
+    [PSCustomObject]@{ Nombre='Propiedades del mouse'; Exe='control.exe'; Args='mouse' }
+    [PSCustomObject]@{ Nombre='Conexiones de red'; Exe='control.exe'; Args='netconnections' }
+    [PSCustomObject]@{ Nombre='Energia'; Exe='control.exe'; Args='powercfg.cpl' }
+    [PSCustomObject]@{ Nombre='Impresoras'; Exe='control.exe'; Args='printers' }
+    [PSCustomObject]@{ Nombre='Programas y caracteristicas'; Exe='appwiz.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Region'; Exe='intl.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Seguridad y mantenimiento'; Exe='wscui.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Sonido'; Exe='mmsys.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Propiedades del sistema'; Exe='sysdm.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Fecha y hora'; Exe='timedate.cpl'; Args='' }
+    [PSCustomObject]@{ Nombre='Firewall de Windows'; Exe='control.exe'; Args='firewall.cpl' }
+    [PSCustomObject]@{ Nombre='Restaurar sistema'; Exe='rstrui.exe'; Args='' }
+)
+
+function Update-TweakBoton {
+    param($Tweak)
+    $btn = $script:TweakBotones[$Tweak.Id]
+    $lbl = $script:TweakEstados[$Tweak.Id]
+    if (-not $btn) { return }
+
+    if ($Tweak.Accion) {
+        $btn.Content = 'EJECUTAR'
+        $btn.Style = $Window.FindResource('BotonAzul')
+        $btn.IsEnabled = $true
+        if ($lbl) { $lbl.Text = 'Accion puntual'; $lbl.Foreground = '#8494A6' }
+        return
+    }
+
+    if (Test-TweakAplicado $Tweak.Id) {
+        if ($Tweak.SinDeshacer) {
+            $btn.Content = 'APLICADO'
+            $btn.IsEnabled = $false
+            if ($lbl) { $lbl.Text = 'Aplicado (sin deshacer)'; $lbl.Foreground = '#FFB300' }
+        } else {
+            $btn.Content = 'DESHACER'
+            $btn.Style = $Window.FindResource('BotonAmbar')
+            $btn.IsEnabled = $true
+            if ($lbl) { $lbl.Text = 'Aplicado'; $lbl.Foreground = '#FFB300' }
+        }
+    } else {
+        $btn.Content = 'APLICAR'
+        $btn.Style = $Window.FindResource('BotonVerde')
+        $btn.IsEnabled = $true
+        if ($lbl) { $lbl.Text = 'No aplicado'; $lbl.Foreground = '#8494A6' }
+    }
+}
+
+function Update-TweakBotonTodos {
+    foreach ($t in @($script:TweaksCatalogo)) { Update-TweakBoton $t }
+}
+
+function Construir-PanelTweaks {
+    $pnlTweaks.Children.Clear()
+    $script:TweakBotones = @{}
+    $script:TweakEstados = @{}
+
+    $orden = @('Privacidad', 'Interfaz', 'Sistema', 'Mantenimiento')
+    $cats = @($orden) + @($script:TweaksCatalogo | ForEach-Object { $_.Categoria } |
+        Where-Object { $orden -notcontains $_ } | Sort-Object -Unique)
+
+    foreach ($cat in $cats) {
+        $items = @($script:TweaksCatalogo | Where-Object { $_.Categoria -eq $cat })
+        if ($items.Count -eq 0) { continue }
+
+        $head = New-Object System.Windows.Controls.TextBlock
+        $head.Text = "{0}  ({1})" -f $cat.ToUpperInvariant(), $items.Count
+        $head.Foreground = '#29B6F6'
+        $head.FontSize = 12
+        $head.FontWeight = 'SemiBold'
+        $head.Margin = '4,10,0,6'
+        $pnlTweaks.Children.Add($head) | Out-Null
+
+        $wrap = New-Object System.Windows.Controls.WrapPanel
+        foreach ($t in $items) {
+            $card = New-Object System.Windows.Controls.Border
+            $card.Style = $Window.FindResource('Tarjeta')
+            $card.Width = 368
+            $card.Padding = '12'
+            $card.Margin = '0,0,12,12'
+
+            $sp = New-Object System.Windows.Controls.StackPanel
+
+            $titulo = New-Object System.Windows.Controls.TextBlock
+            $titulo.Text = $t.Nombre
+            $titulo.FontSize = 13
+            $titulo.FontWeight = 'SemiBold'
+            $titulo.Foreground = '#E6EDF3'
+            $titulo.TextWrapping = 'Wrap'
+            $sp.Children.Add($titulo) | Out-Null
+
+            $riesgo = New-Object System.Windows.Controls.TextBlock
+            $riesgo.Text = if ($t.Riesgo -eq 'Avanzado') { 'AVANZADO' } else { 'SEGURO' }
+            $riesgo.FontSize = 9.5
+            $riesgo.FontWeight = 'SemiBold'
+            $riesgo.Foreground = if ($t.Riesgo -eq 'Avanzado') { '#FFB300' } else { '#00E676' }
+            $riesgo.Margin = '0,2,0,4'
+            $sp.Children.Add($riesgo) | Out-Null
+
+            $desc = New-Object System.Windows.Controls.TextBlock
+            $desc.Text = $t.Descripcion
+            $desc.FontSize = 10.5
+            $desc.Foreground = '#8494A6'
+            $desc.TextWrapping = 'Wrap'
+            $desc.Margin = '0,0,0,4'
+            $sp.Children.Add($desc) | Out-Null
+
+            $estado = New-Object System.Windows.Controls.TextBlock
+            $estado.FontSize = 10
+            $estado.Foreground = '#8494A6'
+            $estado.Margin = '0,4,0,0'
+            $sp.Children.Add($estado) | Out-Null
+
+            $btn = New-Object System.Windows.Controls.Button
+            $btn.Height = 30
+            $btn.Padding = '12,0'
+            $btn.Margin = '0,8,0,0'
+            $btn.HorizontalAlignment = 'Left'
+            $btn.Tag = $t.Id
+            $btn.Add_Click({ param($s, $e) Invoke-TweakUI $s.Tag })
+            $sp.Children.Add($btn) | Out-Null
+
+            $script:TweakBotones[$t.Id] = $btn
+            $script:TweakEstados[$t.Id] = $estado
+
+            $card.Child = $sp
+            $wrap.Children.Add($card) | Out-Null
+        }
+        $pnlTweaks.Children.Add($wrap) | Out-Null
+    }
+
+    Update-TweakBotonTodos
+    $txtTweaksEstado.Text = "{0} ajustes disponibles. Los cambios se guardan en Data\Ajustes\estado.json." -f $script:TweaksCatalogo.Count
+}
+
+function Invoke-TweakUI {
+    param([string]$Id)
+    $t = $script:TweaksCatalogo | Where-Object { $_.Id -eq $Id } | Select-Object -First 1
+    if (-not $t) { return }
+
+    if ($t.Accion) {
+        $r = [System.Windows.MessageBox]::Show(
+            "Se ejecutara: $($t.Nombre).`n`n$($t.Descripcion)`n`n¿Continuar?",
+            'Ajustes', 'YesNo', 'Question')
+        if ($r -eq 'Yes') { Start-TweakTask -Tweak $t -Undo $false }
+        return
+    }
+
+    $aplicado = Test-TweakAplicado $t.Id
+    if ($aplicado -and $t.SinDeshacer) {
+        Show-Mensaje 'Este ajuste se aplico y no se puede deshacer desde aqui.' 'Ajustes' 'Information'
+        return
+    }
+
+    $accion = if ($aplicado) { 'deshacer' } else { 'aplicar' }
+    $aviso = if ($t.Riesgo -eq 'Avanzado') { "`n`nATENCION: ajuste AVANZADO. Puede afectar funciones del sistema." } else { '' }
+    $r = [System.Windows.MessageBox]::Show(
+        "Se va a $accion el ajuste:`n`n$($t.Nombre)`n$($t.Descripcion)$aviso`n`n¿Continuar?",
+        'Ajustes', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    Start-TweakTask -Tweak $t -Undo $aplicado
+}
+
+function Start-TweakTask {
+    param($Tweak, [bool]$Undo)
+    $tweak = $Tweak
+    $payload = [PSCustomObject]@{
+        Tweak = $Tweak
+        Undo = $Undo
+        EstadoPath = $script:TweaksEstadoPath
+        Log = $script:LogFile
+    }
+
+    Set-Estado ("Ajuste en curso: {0}" -f $tweak.Nombre) 'info'
+    $txtTweaksEstado.Text = "Aplicando $($tweak.Nombre)..."
+    Write-Log ("Ajuste {0}: {1}" -f $(if ($Undo) { 'deshacer' } else { 'aplicar' }), $tweak.Id)
+
+    Start-Tarea -Script {
+        param($p)
+        $t = $p.Tweak
+        $undo = [bool]$p.Undo
+        $estadoPath = $p.EstadoPath
+        $logPath = $p.Log
+        $errores = New-Object System.Collections.ArrayList
+
+        function Write-AjusteLog([string]$m) {
+            try { Add-Content -Path $logPath -Encoding UTF8 -Value ("{0} [AJUSTE] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) } catch {}
+        }
+        function Ensure-HKU {
+            if (-not (Test-Path 'HKU:\')) {
+                try { New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -ErrorAction Stop | Out-Null } catch {}
+            }
+        }
+        function Read-Estado {
+            if (Test-Path $estadoPath) {
+                try {
+                    $leido = Get-Content -Path $estadoPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($leido) { return $leido }
+                } catch {}
+            }
+            return [PSCustomObject]@{}
+        }
+        function Save-Estado($s) {
+            try {
+                $dir = Split-Path $estadoPath -Parent
+                if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                $s | ConvertTo-Json -Depth 12 | Out-File -FilePath $estadoPath -Encoding UTF8 -Force
+            } catch {
+                [void]$errores.Add("No se pudo guardar el estado: $($_.Exception.Message)")
+            }
+        }
+        function Get-RegActual([string]$path, [string]$name) {
+            try {
+                $item = Get-ItemProperty -Path $path -Name $name -ErrorAction Stop
+                $tipo = (Get-Item -Path $path).GetValueKind($name).ToString()
+                return [PSCustomObject]@{ Path=$path; Name=$name; Existia=$true; Valor=$item.$name; Tipo=$tipo }
+            } catch {
+                return [PSCustomObject]@{ Path=$path; Name=$name; Existia=$false; Valor='<RemoveEntry>'; Tipo='String' }
+            }
+        }
+        function Set-RegValor([string]$path, [string]$name, $valor, [string]$tipo) {
+            try {
+                if ("$valor" -eq '<RemoveEntry>') {
+                    if (Test-Path $path) { Remove-ItemProperty -Path $path -Name $name -Force -ErrorAction SilentlyContinue }
+                } else {
+                    if (-not (Test-Path $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
+                    Set-ItemProperty -Path $path -Name $name -Value $valor -Type $tipo -Force -ErrorAction Stop
+                }
+            } catch {
+                [void]$errores.Add("Registro ${path}\${name}: $($_.Exception.Message)")
+            }
+        }
+        function Get-ServicioActual([string]$name) {
+            try {
+                $svc = Get-Service -Name $name -ErrorAction Stop
+                if ($svc.StartType) { return [string]$svc.StartType }
+            } catch {}
+            try {
+                $cim = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+                switch ($cim.StartMode) {
+                    'Auto' { return 'Automatic' }
+                    'Manual' { return 'Manual' }
+                    'Disabled' { return 'Disabled' }
+                    default { return [string]$cim.StartMode }
+                }
+            } catch { return $null }
+        }
+        function Set-ServicioTipo([string]$name, [string]$tipo) {
+            if (-not $tipo) { return }
+            try {
+                Set-Service -Name $name -StartupType $tipo -ErrorAction Stop
+            } catch {
+                [void]$errores.Add("Servicio ${name}: $($_.Exception.Message)")
+            }
+        }
+
+        Ensure-HKU
+        $estado = Read-Estado
+
+        if ($undo) {
+            $entry = $null
+            if ($estado.PSObject.Properties.Name -contains $t.Id) { $entry = $estado.($t.Id) }
+
+            if ($entry -and $entry.Registro) {
+                foreach ($r in @($entry.Registro)) {
+                    Set-RegValor $r.Path $r.Name $r.Valor $r.Tipo
+                }
+            } elseif ($t.Registro) {
+                foreach ($r in @($t.Registro)) {
+                    Set-RegValor $r.Path $r.Name $r.OriginalValue $r.Type
+                }
+            }
+
+            if ($entry -and $entry.Servicios) {
+                foreach ($s in @($entry.Servicios)) {
+                    Set-ServicioTipo $s.Name $s.Inicio
+                }
+            } elseif ($t.Servicios) {
+                foreach ($s in @($t.Servicios)) {
+                    Set-ServicioTipo $s.Name $s.OriginalType
+                }
+            }
+
+            foreach ($sc in @($t.UndoScript)) {
+                if ([string]::IsNullOrWhiteSpace($sc)) { continue }
+                try { Invoke-Expression $sc } catch { [void]$errores.Add("Script: $($_.Exception.Message)") }
+            }
+
+            if ($estado.PSObject.Properties.Name -contains $t.Id) {
+                $estado.PSObject.Properties.Remove($t.Id)
+                Save-Estado $estado
+            }
+            Write-AjusteLog "Deshecho: $($t.Id)"
+        } else {
+            $regs = @()
+            $servs = @()
+            foreach ($r in @($t.Registro)) {
+                $regs += Get-RegActual $r.Path $r.Name
+                Set-RegValor $r.Path $r.Name $r.Value $r.Type
+            }
+            foreach ($s in @($t.Servicios)) {
+                $servs += [PSCustomObject]@{ Name=$s.Name; Inicio=(Get-ServicioActual $s.Name) }
+                Set-ServicioTipo $s.Name $s.StartupType
+            }
+            foreach ($sc in @($t.Script)) {
+                if ([string]::IsNullOrWhiteSpace($sc)) { continue }
+                try { Invoke-Expression $sc } catch { [void]$errores.Add("Script: $($_.Exception.Message)") }
+            }
+
+            if (-not $t.Accion) {
+                $entry = [PSCustomObject]@{
+                    Fecha = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                    Registro = @($regs)
+                    Servicios = @($servs)
+                }
+                $estado | Add-Member -NotePropertyName $t.Id -NotePropertyValue $entry -Force
+                Save-Estado $estado
+            }
+            Write-AjusteLog "Aplicado: $($t.Id)"
+        }
+
+        return [PSCustomObject]@{
+            Ok = ($errores.Count -eq 0)
+            Errores = @($errores)
+            Id = $t.Id
+            Undo = $undo
+            Accion = [bool]$t.Accion
+        }
+    } -Argumentos @(, $payload) -OnDone ({
+        param($resultado, $errorTxt)
+        Load-TweaksEstado
+        Update-TweakBotonTodos
+
+        if ($resultado) {
+            if ($resultado.Ok) {
+                $txtTweaksEstado.Text = if ($resultado.Accion) { "Listo: $($tweak.Nombre)" } else { "Ajuste listo: $($tweak.Nombre)" }
+                Set-Estado $txtTweaksEstado.Text 'ok'
+                Write-Log ("Ajuste completado: {0}" -f $tweak.Id)
+            } else {
+                $detalle = (@($resultado.Errores) -join ' | ')
+                $txtTweaksEstado.Text = "Con avisos: $($tweak.Nombre) - $detalle"
+                Set-Estado "Ajuste con avisos: $($tweak.Nombre)" 'warn'
+                Write-Log ("Ajuste con avisos {0}: {1}" -f $tweak.Id, $detalle) 'WARN'
+            }
+        } else {
+            $txtTweaksEstado.Text = "Error: $errorTxt"
+            Set-Estado "Error aplicando $($tweak.Nombre)" 'error'
+            Write-Log ("Ajuste fallido {0}: {1}" -f $tweak.Id, $errorTxt) 'ERROR'
+        }
+    }.GetNewClosure())
+}
+
+# =============================================================================
+#  APPX (apps preinstaladas)
+# =============================================================================
+function Update-ResumenAppx {
+    $sel = @($script:AppxCatalogo | Where-Object { $_.Seleccionada }).Count
+    $inst = @($script:AppxInstaladas).Count
+    $txtAppxEstado.Text = "{0} apps · {1} instaladas · {2} seleccionadas" -f $script:AppxCatalogo.Count, $inst, $sel
+}
+
+function Update-EtiquetasAppx {
+    foreach ($a in @($script:AppxCatalogo)) {
+        $cb = $script:AppxChecks[$a.Id]
+        if (-not $cb) { continue }
+        $marca = if (@($script:AppxInstaladas) -contains $a.Id) { '● ' } else { '' }
+        $cb.Content = $marca + $a.Nombre
+    }
+}
+
+function Construir-PanelAppx {
+    $pnlAppx.Children.Clear()
+    $script:AppxChecks = @{}
+    $cats = @($script:AppxCatalogo | ForEach-Object { $_.Categoria } | Sort-Object -Unique)
+
+    foreach ($cat in $cats) {
+        $items = @($script:AppxCatalogo | Where-Object { $_.Categoria -eq $cat })
+        if ($items.Count -eq 0) { continue }
+
+        $head = New-Object System.Windows.Controls.TextBlock
+        $head.Text = "{0}  ({1})" -f $cat.ToUpperInvariant(), $items.Count
+        $head.Foreground = '#29B6F6'
+        $head.FontSize = 12
+        $head.FontWeight = 'SemiBold'
+        $head.Margin = '4,10,0,6'
+        $pnlAppx.Children.Add($head) | Out-Null
+
+        $wrap = New-Object System.Windows.Controls.WrapPanel
+        foreach ($a in $items) {
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Tag = $a
+            $cb.Width = 270
+            $cb.Margin = '2,4,10,4'
+            $cb.ToolTip = $a.Descripcion
+            $cb.IsChecked = [bool]$a.Seleccionada
+            $cb.Add_Click({
+                param($s, $e)
+                $s.Tag.Seleccionada = [bool]$s.IsChecked
+                Update-ResumenAppx
+            })
+            $script:AppxChecks[$a.Id] = $cb
+            $wrap.Children.Add($cb) | Out-Null
+        }
+        $pnlAppx.Children.Add($wrap) | Out-Null
+    }
+
+    Update-EtiquetasAppx
+    Update-ResumenAppx
+}
+
+function Detectar-Appx {
+    Set-Estado 'Detectando apps instaladas...' 'info'
+    $txtAppxEstado.Text = 'Detectando apps instaladas...'
+    Start-Tarea -Script {
+        param($ids)
+        $instaladas = @()
+        foreach ($id in $ids) {
+            try {
+                if (Get-AppxPackage -Name $id -ErrorAction SilentlyContinue) { $instaladas += $id }
+            } catch {}
+        }
+        return [PSCustomObject]@{ Instaladas = @($instaladas) }
+    } -Argumentos @(, @($script:AppxCatalogo | ForEach-Object { $_.Id })) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            $script:AppxInstaladas = @($resultado.Instaladas)
+            Update-EtiquetasAppx
+            Update-ResumenAppx
+            Set-Estado ("Apps instaladas detectadas: {0}" -f @($script:AppxInstaladas).Count) 'ok'
+        } else {
+            $txtAppxEstado.Text = "No se pudo detectar: $errorTxt"
+            Set-Estado 'No se pudieron detectar las apps instaladas' 'warn'
+        }
+    }
+}
+
+function Start-QuitarAppx {
+    $sel = @($script:AppxCatalogo | Where-Object { $_.Seleccionada })
+    if ($sel.Count -eq 0) { Show-Mensaje 'Marca al menos una app.' 'Apps preinstaladas'; return }
+
+    $nombres = (@($sel | ForEach-Object { $_.Nombre }) -join ', ')
+    $r = [System.Windows.MessageBox]::Show(
+        "Se quitaran $($sel.Count) apps:`n`n$nombres`n`n¿Continuar?",
+        'Quitar apps preinstaladas', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Set-Estado ("Quitando {0} apps preinstaladas..." -f $sel.Count) 'info'
+    $txtAppxEstado.Text = 'Quitando apps preinstaladas...'
+    Write-Log ("AppX quitar: " + ($sel | ForEach-Object { $_.Id } -join ', '))
+
+    $payload = [PSCustomObject]@{ Apps = $sel; Log = $script:LogFile }
+    Start-Tarea -Script {
+        param($p)
+        $ok = 0
+        $exitosos = @()
+        $fallidos = @()
+        foreach ($a in $p.Apps) {
+            $removido = $false
+            try {
+                $pkgs = @(Get-AppxPackage -Name $a.Id -AllUsers -ErrorAction SilentlyContinue |
+                    Sort-Object PackageFullName -Unique)
+                if ($pkgs.Count -eq 0) {
+                    $removido = $true
+                } else {
+                    foreach ($pkg in $pkgs) {
+                        try {
+                            Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                            $removido = $true
+                        } catch {}
+                    }
+                }
+                try {
+                    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -eq $a.Id } |
+                        ForEach-Object { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction SilentlyContinue | Out-Null }
+                } catch {}
+            } catch {}
+
+            if ($removido) { $ok++; $exitosos += $a.Id } else { $fallidos += $a.Nombre }
+            try {
+                Add-Content -Path $p.Log -Encoding UTF8 -Value (
+                    '{0} [APPX] quitar {1} -> {2}' -f (Get-Date -Format 'HH:mm:ss'), $a.Id, $(if ($removido) { 'OK' } else { 'ERROR' }))
+            } catch {}
+        }
+        return [PSCustomObject]@{ Ok=$ok; Exitosos=@($exitosos); Fallidos=@($fallidos) }
+    } -Argumentos @(, $payload) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            $script:AppxInstaladas = @($script:AppxInstaladas | Where-Object { $resultado.Exitosos -notcontains $_ })
+            foreach ($a in @($script:AppxCatalogo)) { $a.Seleccionada = $false }
+            foreach ($cb in $script:AppxChecks.Values) { $cb.IsChecked = $false }
+            Update-EtiquetasAppx
+            Update-ResumenAppx
+            if (@($resultado.Fallidos).Count -eq 0) {
+                $txtAppxEstado.Text = "Apps quitadas: $($resultado.Ok)"
+                Set-Estado $txtAppxEstado.Text 'ok'
+            } else {
+                $txtAppxEstado.Text = "Quitadas: $($resultado.Ok) · fallidas: $(@($resultado.Fallidos).Count)"
+                Set-Estado 'Algunas apps no se pudieron quitar' 'warn'
+            }
+            Write-Log $txtAppxEstado.Text
+        } else {
+            $txtAppxEstado.Text = "Error: $errorTxt"
+            Set-Estado 'Error quitando apps preinstaladas' 'error'
+            Write-Log "AppX quitar: $errorTxt" 'ERROR'
+        }
+    }
+}
+
+function Start-InstalarAppx {
+    $sel = @($script:AppxCatalogo | Where-Object { $_.Seleccionada })
+    if ($sel.Count -eq 0) { Show-Mensaje 'Marca al menos una app.' 'Apps preinstaladas'; return }
+
+    $nombres = (@($sel | ForEach-Object { $_.Nombre }) -join ', ')
+    $r = [System.Windows.MessageBox]::Show(
+        "Se instalaran o repararan $($sel.Count) apps:`n`n$nombres`n`nRequiere internet y Microsoft Store. ¿Continuar?",
+        'Instalar apps preinstaladas', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-Estado ("Instalando {0} apps preinstaladas..." -f $sel.Count) 'info'
+    $txtAppxEstado.Text = 'Instalando apps preinstaladas...'
+    Write-Log ("AppX instalar: " + ($sel | ForEach-Object { $_.Id } -join ', '))
+
+    $payload = [PSCustomObject]@{ Apps = $sel; Log = $script:LogFile }
+    Start-Tarea -Script {
+        param($p)
+        $ok = 0
+        $exitosos = @()
+        $fallidos = @()
+        foreach ($a in $p.Apps) {
+            $instalado = $false
+            try {
+                if (Get-AppxPackage -Name $a.Id -ErrorAction SilentlyContinue) {
+                    $instalado = $true
+                } else {
+                    $manifests = @()
+                    Get-AppxPackage -AllUsers -Name $a.Id -ErrorAction SilentlyContinue | ForEach-Object {
+                        if ($_.InstallLocation) { $manifests += (Join-Path $_.InstallLocation 'AppxManifest.xml') }
+                    }
+                    Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -eq $a.Id } | ForEach-Object {
+                            if ($_.InstallLocation) { $manifests += (Join-Path $_.InstallLocation 'AppxManifest.xml') }
+                        }
+                    $manifest = $manifests | Where-Object { Test-Path $_ } | Select-Object -First 1
+                    if ($manifest) {
+                        try {
+                            Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ErrorAction Stop
+                            $instalado = $true
+                        } catch {}
+                    }
+                    if (-not $instalado -and $a.StoreId) {
+                        $proc = Start-Process -FilePath 'winget' -ArgumentList @(
+                            'install', '--id', $a.StoreId, '--source', 'msstore', '--silent',
+                            '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'
+                        ) -Wait -PassThru -WindowStyle Hidden
+                        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq -1978335189 -or $proc.ExitCode -eq -1978335135) {
+                            $instalado = $true
+                        }
+                    }
+                }
+            } catch {}
+
+            if ($instalado) { $ok++; $exitosos += $a.Id } else { $fallidos += $a.Nombre }
+            try {
+                Add-Content -Path $p.Log -Encoding UTF8 -Value (
+                    '{0} [APPX] instalar {1} -> {2}' -f (Get-Date -Format 'HH:mm:ss'), $a.Id, $(if ($instalado) { 'OK' } else { 'ERROR' }))
+            } catch {}
+        }
+        return [PSCustomObject]@{ Ok=$ok; Exitosos=@($exitosos); Fallidos=@($fallidos) }
+    } -Argumentos @(, $payload) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            $script:AppxInstaladas = @(@($script:AppxInstaladas) + @($resultado.Exitosos) | Sort-Object -Unique)
+            foreach ($a in @($script:AppxCatalogo)) { $a.Seleccionada = $false }
+            foreach ($cb in $script:AppxChecks.Values) { $cb.IsChecked = $false }
+            Update-EtiquetasAppx
+            Update-ResumenAppx
+            if (@($resultado.Fallidos).Count -eq 0) {
+                $txtAppxEstado.Text = "Apps instaladas: $($resultado.Ok)"
+                Set-Estado $txtAppxEstado.Text 'ok'
+            } else {
+                $txtAppxEstado.Text = "Instaladas: $($resultado.Ok) · fallidas: $(@($resultado.Fallidos).Count)"
+                Set-Estado 'Algunas apps no se pudieron instalar' 'warn'
+            }
+            Write-Log $txtAppxEstado.Text
+        } else {
+            $txtAppxEstado.Text = "Error: $errorTxt"
+            Set-Estado 'Error instalando apps preinstaladas' 'error'
+            Write-Log "AppX instalar: $errorTxt" 'ERROR'
+        }
+    }
+}
+
+# =============================================================================
+#  CONFIG: reparaciones y caracteristicas
+# =============================================================================
+function Set-ConfigEstado {
+    param([string]$Texto, [string]$Tipo = 'info')
+    $txtConfigEstado.Text = $Texto
+    Set-Estado $Texto $Tipo
+}
+
+function Start-ConfigTask {
+    param([string]$Nombre, [scriptblock]$Script)
+    $nombreTarea = $Nombre
+    Set-ConfigEstado "$Nombre en curso..." 'info'
+    Write-Log ("Config: {0}" -f $Nombre)
+    Start-Tarea -Script $Script -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) {
+            Set-ConfigEstado "${nombreTarea}: $errorTxt" 'error'
+            Write-Log ("Config {0}: {1}" -f $nombreTarea, $errorTxt) 'ERROR'
+            return
+        }
+        if ($resultado -and $resultado.PSObject.Properties.Name -contains 'Ok' -and -not $resultado.Ok) {
+            $detalle = if ($resultado.Detalle) { $resultado.Detalle } else { 'revisa el log' }
+            Set-ConfigEstado "$nombreTarea con avisos: $detalle" 'warn'
+            Write-Log ("Config {0}: {1}" -f $nombreTarea, $detalle) 'WARN'
+            return
+        }
+        $detalle = if ($resultado -and $resultado.Detalle) { $resultado.Detalle } else { 'completado' }
+        Set-ConfigEstado "$nombreTarea`: $detalle" 'ok'
+        Write-Log ("Config completado: {0} - {1}" -f $nombreTarea, $detalle)
+    }.GetNewClosure())
+}
+
+function Start-FixSFC {
+    Start-ConfigTask 'SFC + DISM' {
+        $sfc = Start-Process -FilePath 'sfc.exe' -ArgumentList '/scannow' -Wait -PassThru -WindowStyle Hidden
+        $dism = Start-Process -FilePath 'dism.exe' -ArgumentList @('/Online','/Cleanup-Image','/RestoreHealth') -Wait -PassThru -WindowStyle Hidden
+        $ok = ($sfc.ExitCode -eq 0 -and $dism.ExitCode -eq 0)
+        return [PSCustomObject]@{ Ok=$ok; Detalle=("SFC={0}, DISM={1}" -f $sfc.ExitCode, $dism.ExitCode) }
+    }
+}
+
+function Start-FixWU {
+    $r = [System.Windows.MessageBox]::Show(
+        "Se detendran los servicios de Windows Update, se renombraran SoftwareDistribution y Catroot2 y se reregistraran DLLs.`n`nEl equipo puede tardar varios minutos y conviene reiniciar al terminar. ¿Continuar?",
+        'Resetear Windows Update', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Start-ConfigTask 'Reset de Windows Update' {
+        $ErrorActionPreference = 'SilentlyContinue'
+        $stamp = Get-Date -Format 'yyyyMMddHHmm'
+        Stop-Service BITS, wuauserv, cryptsvc, appidsvc -Force -ErrorAction SilentlyContinue
+        Remove-Item "$env:ALLUSERSPROFILE\Application Data\Microsoft\Network\Downloader\qmgr*.dat" -Force -ErrorAction SilentlyContinue
+        if (Test-Path "$env:SystemRoot\SoftwareDistribution") {
+            Rename-Item "$env:SystemRoot\SoftwareDistribution" "SoftwareDistribution.bak-$stamp" -ErrorAction SilentlyContinue
+        }
+        if (Test-Path "$env:SystemRoot\System32\Catroot2") {
+            Rename-Item "$env:SystemRoot\System32\Catroot2" "Catroot2.bak-$stamp" -ErrorAction SilentlyContinue
+        }
+        $dlls = @('atl.dll','urlmon.dll','mshtml.dll','shdocvw.dll','browseui.dll','jscript.dll','vbscript.dll',
+                  'scrrun.dll','msxml3.dll','msxml6.dll','actxprxy.dll','softpub.dll','wintrust.dll','dssenh.dll',
+                  'rsaenh.dll','oleaut32.dll','ole32.dll','shell32.dll','initpki.dll','wuapi.dll','wuaueng.dll',
+                  'wups.dll','wups2.dll','qmgr.dll')
+        Push-Location "$env:SystemRoot\System32"
+        foreach ($d in $dlls) { Start-Process -FilePath 'regsvr32.exe' -ArgumentList '/s', $d -Wait -WindowStyle Hidden }
+        Pop-Location
+        Start-Process -FilePath 'netsh.exe' -ArgumentList @('winsock','reset') -Wait -WindowStyle Hidden
+        Start-Process -FilePath 'netsh.exe' -ArgumentList @('winhttp','reset','proxy') -Wait -WindowStyle Hidden
+        Set-Service -Name BITS -StartupType Manual -ErrorAction SilentlyContinue
+        Set-Service -Name wuauserv -StartupType Manual -ErrorAction SilentlyContinue
+        Set-Service -Name cryptsvc -StartupType Manual -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\AppIDSvc' -Name Start -Value 3 -Type DWord -ErrorAction SilentlyContinue
+        Start-Service BITS, wuauserv, cryptsvc, appidsvc -ErrorAction SilentlyContinue
+        try { (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNow() } catch {}
+        return [PSCustomObject]@{ Ok=$true; Detalle='servicios reiniciados; reinicia el equipo' }
+    }
+}
+
+function Start-FixRed {
+    $r = [System.Windows.MessageBox]::Show(
+        "Se resetearan winsock, TCP/IP y WinHTTP. Las conexiones de red se cortaran un momento y hace falta reiniciar. ¿Continuar?",
+        'Resetear red', 'YesNo', 'Warning')
+    if ($r -ne 'Yes') { return }
+
+    Start-ConfigTask 'Reset de red' {
+        Start-Process -FilePath 'netsh.exe' -ArgumentList @('winsock','reset') -Wait -WindowStyle Hidden
+        Start-Process -FilePath 'netsh.exe' -ArgumentList @('int','ip','reset') -Wait -WindowStyle Hidden
+        Start-Process -FilePath 'netsh.exe' -ArgumentList @('winhttp','reset','proxy') -Wait -WindowStyle Hidden
+        Start-Process -FilePath 'ipconfig.exe' -ArgumentList @('/flushdns') -Wait -WindowStyle Hidden
+        Start-Process -FilePath 'ipconfig.exe' -ArgumentList @('/registerdns') -Wait -WindowStyle Hidden
+        return [PSCustomObject]@{ Ok=$true; Detalle='red reseteada; reinicia el equipo' }
+    }
+}
+
+function Start-FixNTP {
+    Start-ConfigTask 'Hora NTP' {
+        Start-Service w32time -ErrorAction SilentlyContinue
+        Start-Process -FilePath 'w32tm.exe' -ArgumentList @('/config','/update','/manualpeerlist:pool.ntp.org,0x8','/syncfromflags:MANUAL') -Wait -WindowStyle Hidden
+        Restart-Service w32time -ErrorAction SilentlyContinue
+        $p = Start-Process -FilePath 'w32tm.exe' -ArgumentList @('/resync') -Wait -PassThru -WindowStyle Hidden
+        return [PSCustomObject]@{ Ok=($p.ExitCode -eq 0); Detalle=("w32time resync={0}" -f $p.ExitCode) }
+    }
+}
+
+function Start-FixTemp {
+    Start-ConfigTask 'Limpiar temporales' {
+        $antes = 0
+        try { $antes = @(Get-ChildItem $env:TEMP -Force -ErrorAction SilentlyContinue).Count } catch {}
+        Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Ok=$true; Detalle=("temporales del usuario: {0} elementos" -f $antes) }
+    }
+}
+
+function Start-FixDISM {
+    Start-ConfigTask 'Limpieza de componentes' {
+        $p = Start-Process -FilePath 'dism.exe' -ArgumentList @('/Online','/Cleanup-Image','/StartComponentCleanup') -Wait -PassThru -WindowStyle Hidden
+        return [PSCustomObject]@{ Ok=($p.ExitCode -eq 0); Detalle=("DISM={0}" -f $p.ExitCode) }
+    }
+}
+
+function Start-CompactOS {
+    $r = [System.Windows.MessageBox]::Show(
+        "Se activara CompactOS: Windows comprime los archivos del sistema con LZX/XPRESS.`n`nLibera entre 1 y 4 GB segun el equipo y tarda unos minutos. No borra nada y se puede revertir con compact /CompactOS:never.`n`n¿Aplicar CompactOS ahora?",
+        'CompactOS', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Start-ConfigTask 'CompactOS' {
+        $salida = (& compact.exe /CompactOS:always 2>&1 | Out-String)
+        $codigo = $LASTEXITCODE
+        $texto = ($salida -replace '\s+', ' ').Trim()
+        if ($codigo -eq 0) {
+            return [PSCustomObject]@{ Ok = $true; Detalle = 'sistema comprimido (CompactOS:always)' }
+        }
+        if (-not $texto) { $texto = "compact.exe termino con codigo $codigo" }
+        return [PSCustomObject]@{ Ok = $false; Detalle = ("no aplicado (codigo {0}): {1}" -f $codigo, $texto) }
+    }
+}
+
+# =============================================================================
+#  HERRAMIENTAS: drivers, portables, backup de usuario y reporte de salud
+# =============================================================================
+
+# Carpeta donde se guardan las herramientas descargadas. Si el paquete trae
+# Tools\ se usa esa; si se ejecuta desde %TEMP% (modo irm) se usa una cache
+# permanente en LOCALAPPDATA para no volver a descargar en cada visita.
+function Get-ToolsDir {
+    if (Test-Path $script:ToolsDir) {
+        try {
+            $prueba = Join-Path $script:ToolsDir '.escritura'
+            Set-Content -Path $prueba -Value 'ok' -ErrorAction Stop
+            Remove-Item $prueba -Force -ErrorAction SilentlyContinue
+            return $script:ToolsDir
+        } catch {}
+    }
+    $base = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = $script:Root }
+    $cache = Join-Path $base 'WigglesMini\Herramientas'
+    if (-not (Test-Path $cache)) { New-Item -ItemType Directory -Path $cache -Force | Out-Null }
+    return $cache
+}
+
+function Set-ToolsEstado {
+    param([string]$Texto, [string]$Tipo = 'info')
+    try { $txtToolsEstado.Text = $Texto } catch {}
+    Set-Estado $Texto $Tipo
+}
+
+function Resolve-UrlHerramienta {
+    param($H)
+    $base = [string]$script:Config['RepoBase']
+    if ([string]::IsNullOrWhiteSpace($base)) {
+        $base = 'https://raw.githubusercontent.com/WigglesVz/wiggles-mini/main'
+    }
+    if ($H.Url) {
+        if ($H.Url -match '^https?://') { return $H.Url }
+        return ($base.TrimEnd('/') + '/' + $H.Url.TrimStart('/'))
+    }
+    if ($H.Tipo -eq 'portable' -and $H.Archivo) {
+        $rel = ($H.Carpeta.TrimEnd('/') + '/' + $H.Archivo)
+        return ($base.TrimEnd('/') + '/' + $rel.TrimStart('/'))
+    }
+    return ''
+}
+
+# Devuelve la ruta del ejecutable si ya esta disponible en disco, o $null.
+function Get-RutaHerramienta {
+    param($H)
+    if (-not $H) { return $null }
+    if ($H.Tipo -eq 'portable') {
+        $exe = Join-Path (Join-Path (Get-ToolsDir) $H.Id) $H.Ejecutable
+        if (Test-Path $exe) { return $exe }
+        # Tambien vale si ya viene dentro del paquete (USB o copia local).
+        $exe2 = Join-Path (Join-Path $script:ToolsDir ('Portables\' + $H.Id)) $H.Ejecutable
+        if (Test-Path $exe2) { return $exe2 }
+        return $null
+    }
+    if ($H.Tipo -eq 'local' -and $H.RutaLocal) {
+        $exe = Join-Path $script:Root $H.RutaLocal
+        if (Test-Path $exe) { return $exe }
+        return $null
+    }
+    return $null
+}
+
+# Descarga y descomprime una herramienta portable. Devuelve la ruta del .exe.
+# Si el paquete viaja con la herramienta (USB o copia local en Tools\Portables),
+# se usa ese zip y no se descarga nada.
+function Install-Herramienta {
+    param($H)
+    if ($H.Tipo -ne 'portable') { return $null }
+
+    $dir = Get-ToolsDir
+    $zip = Join-Path $dir $H.Archivo
+
+    $zipLocal = ''
+    if ($H.Carpeta) {
+        $zipLocal = Join-Path $script:Root ($H.Carpeta -replace '/', '\')
+        $zipLocal = Join-Path $zipLocal $H.Archivo
+    }
+    if ((Test-Path $zipLocal) -and ((Get-Item $zipLocal).Length -gt 1024)) {
+        $zip = $zipLocal
+    } elseif (-not (Test-Path $zip)) {
+        $url = Resolve-UrlHerramienta -H $H
+        if (-not $url) { throw 'Esta herramienta no tiene URL de descarga.' }
+        Set-ToolsEstado ("Descargando {0} ({1:0.#} MB)..." -f $H.Nombre, $H.MB) 'info'
+        Write-Log ("Descargando herramienta: {0} -> {1}" -f $H.Nombre, $url)
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        } catch {}
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600
+    }
+    if ((Get-Item $zip).Length -lt 1024) { throw 'La descarga llego vacia o incompleta.' }
+
+    $carpeta = Join-Path $dir $H.Id
+    $exe = Join-Path $carpeta $H.Ejecutable
+    if (-not (Test-Path $exe)) {
+        Set-ToolsEstado ("Descomprimiendo {0}..." -f $H.Nombre) 'info'
+        if (Test-Path $carpeta) { Remove-Item $carpeta -Recurse -Force -ErrorAction SilentlyContinue }
+        Expand-Archive -Path $zip -DestinationPath $carpeta -Force
+    }
+    if (-not (Test-Path $exe)) { throw ("El paquete no contiene {0}." -f $H.Ejecutable) }
+    return $exe
+}
+
+# Punto unico de entrada de los botones de herramientas.
+function Invoke-Herramienta {
+    param($H)
+    if (-not $H) { return }
+
+    try {
+        switch ($H.Tipo) {
+
+            'url' {
+                if (-not $H.UrlAlt) { throw 'No hay pagina configurada.' }
+                Start-Process $H.UrlAlt
+                Set-ToolsEstado ("Abriendo la pagina oficial de {0}." -f $H.Nombre) 'info'
+                Write-Log ("Herramienta URL: {0} -> {1}" -f $H.Nombre, $H.UrlAlt)
+                return
+            }
+
+            'winget' {
+                $nombre = $H.Nombre
+                $alt    = $H.UrlAlt
+                $piezas = @('install', '--id', $H.WingetId, '-e', '--silent',
+                            '--accept-package-agreements', '--accept-source-agreements',
+                            '--disable-interactivity')
+                if ($H.Fuente -eq 'msstore') { $piezas += @('--source', 'msstore') }
+                $linea = ($piezas | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+
+                Set-ToolsEstado ("Instalando {0}..." -f $nombre) 'info'
+                Write-Log ("winget: {0}" -f $linea)
+                Start-Tarea -Script {
+                    param($linea)
+                    $p = Start-Process -FilePath 'winget' -ArgumentList $linea -Wait -PassThru -WindowStyle Hidden
+                    return $p.ExitCode
+                } -Argumentos @($linea) -OnDone ({
+                    param($codigo, $errorTxt)
+                    if ($errorTxt -or "$codigo" -ne '0') {
+                        Set-ToolsEstado ("{0}: no se pudo instalar (codigo {1}). Se abre la pagina oficial." -f $nombre, $codigo) 'warn'
+                        if ($alt) { try { Start-Process $alt } catch {} }
+                    } else {
+                        Set-ToolsEstado ("{0} instalado." -f $nombre) 'ok'
+                        Update-PanelTools
+                    }
+                }.GetNewClosure())
+                return
+            }
+
+            default {
+                $exe = Get-RutaHerramienta -H $H
+                if (-not $exe) {
+                    if ($H.Tipo -eq 'local') {
+                        $destino = Join-Path $script:Root $H.RutaLocal
+                        Show-Mensaje ("{0} no esta en el paquete.`n`nCopia el archivo en:`n{1}`n`nAsi queda disponible sin internet." -f $H.Nombre, $destino) 'Herramienta' 'Information'
+                        return
+                    }
+                    $exe = Install-Herramienta -H $H
+                }
+                if (-not $exe -or -not (Test-Path $exe)) { throw 'No se encontro el ejecutable.' }
+                if ($H.Args) { Start-Process -FilePath $exe -ArgumentList $H.Args }
+                else { Start-Process -FilePath $exe }
+                Set-ToolsEstado ("{0} abierto." -f $H.Nombre) 'ok'
+                Write-Log ("Herramienta abierta: {0} ({1})" -f $H.Nombre, $exe)
+                Update-PanelTools
+            }
+        }
+    } catch {
+        Set-ToolsEstado ("{0}: {1}" -f $H.Nombre, $_.Exception.Message) 'error'
+        Write-Log ("Herramienta {0}: {1}" -f $H.Nombre, $_.Exception.Message) 'ERROR'
+    }
+}
+
+# Dibuja los botones de portables y fabricantes segun lo que ya esta en disco.
+function Update-PanelTools {
+    try { $pnlPortables.Children.Clear() } catch { return }
+    try { $pnlFabricantes.Children.Clear() } catch {}
+
+    $paneles = @{
+        'Portables'  = $pnlPortables
+        'Fabricante' = $pnlFabricantes
+    }
+
+    foreach ($h in @($script:ToolsCatalogo)) {
+        if ($h.Grupo -eq 'Drivers') { continue }
+        $panel = $paneles[$h.Grupo]
+        if (-not $panel) { continue }
+
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Tag     = $h
+        $btn.Height  = 30
+        $btn.Padding = '10,0'
+        $btn.Margin  = '0,0,8,8'
+        $btn.ToolTip = $h.Descripcion
+
+        $local = Get-RutaHerramienta -H $h
+        if ($local) {
+            $btn.Content = ('● ' + $h.Nombre)
+        } elseif ($h.Tipo -eq 'portable') {
+            $btn.Content = ('▸ {0}  ({1:0.#} MB)' -f $h.Nombre, $h.MB)
+        } elseif ($h.Tipo -eq 'local') {
+            $btn.Content = ('○ ' + $h.Nombre)
+            $btn.ToolTip = ($h.Descripcion + ' (no esta en la carpeta Tools)')
+        } else {
+            $btn.Content = $h.Nombre
+        }
+
+        $btn.Add_Click({
+            param($s, $e)
+            Invoke-Herramienta -H $s.Tag
+        })
+        $panel.Children.Add($btn) | Out-Null
+    }
+
+    $carpeta = Get-ToolsDir
+    try { $txtToolsRuta.Text = "Carpeta de herramientas: $carpeta" } catch {}
+    $locales  = @($script:ToolsCatalogo | Where-Object { $_.Tipo -eq 'portable' -or $_.Tipo -eq 'local' })
+    $listos   = @($locales | Where-Object { Get-RutaHerramienta -H $_ }).Count
+    $enPaquete = @($locales | Where-Object { $_.Tipo -eq 'portable' -and $_.Carpeta -and (Test-Path (Join-Path $script:Root ($_.Carpeta -replace '/', '\'))) }).Count
+    try {
+        $txtToolsEstado.Text = ("{0} de {1} portables listas. {2} viajan en el paquete y el resto se descargan solas al pulsarlas." -f $listos, $locales.Count, $enPaquete)
+    } catch {}
+}
+
+# --- DRIVERS ---
+function Start-BackupDrivers {
+    $destino = Join-Path 'C:\Backups_Wiggles' ('Drivers_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    $r = [System.Windows.MessageBox]::Show(
+        ("Se exportaran los drivers del equipo a:`n`n{0}`n`nPuede tardar de 2 a 5 minutos y ocupar entre 300 MB y 1 GB.`n`n¿Continuar?" -f $destino),
+        'Backup de drivers', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado 'Exportando drivers...' 'info'
+    Start-Tarea -Script {
+        param($destino)
+        if (-not (Test-Path $destino)) { New-Item -ItemType Directory -Path $destino -Force | Out-Null }
+        $exportados = @(Export-WindowsDriver -Online -Destination $destino -ErrorAction Stop)
+        $bytes = (Get-ChildItem $destino -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        return [PSCustomObject]@{
+            Ok      = $true
+            Detalle = ("{0} drivers ({1} MB)" -f $exportados.Count, [math]::Round($bytes / 1MB, 0))
+        }
+    } -Argumentos @($destino) -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) {
+            Set-ToolsEstado ("Backup de drivers: $errorTxt") 'error'
+            Write-Log ("Backup drivers: {0}" -f $errorTxt) 'ERROR'
+            return
+        }
+        Set-ToolsEstado ("Backup de drivers listo: {0} en {1}" -f $resultado.Detalle, $destino) 'ok'
+        Write-Log ("Backup drivers: {0} -> {1}" -f $resultado.Detalle, $destino)
+        try { Start-Process explorer.exe $destino } catch {}
+    }.GetNewClosure())
+}
+
+function Start-RestaurarDrivers {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Carpeta con los drivers exportados (.inf)'
+    $dlg.ShowNewFolderButton = $false
+    if (Test-Path 'C:\Backups_Wiggles') { $dlg.SelectedPath = 'C:\Backups_Wiggles' }
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $carpeta = $dlg.SelectedPath
+    $inf = @(Get-ChildItem $carpeta -Recurse -Filter '*.inf' -File -ErrorAction SilentlyContinue).Count
+    if ($inf -eq 0) {
+        Show-Mensaje "No hay archivos .inf en esa carpeta.`n`nElige la carpeta que genero el backup de drivers." 'Restaurar drivers' 'Warning'
+        return
+    }
+
+    $r = [System.Windows.MessageBox]::Show(
+        ("Se instalaran los drivers de:`n{0}`n`n({1} archivos .inf). Windows puede pedir reiniciar al terminar.`n`n¿Continuar?" -f $carpeta, $inf),
+        'Restaurar drivers', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado ("Instalando drivers desde {0}..." -f (Split-Path $carpeta -Leaf)) 'info'
+    Start-Tarea -Script {
+        param($carpeta)
+        $salida = (& pnputil.exe /add-driver (Join-Path $carpeta '*.inf') /subdirs /install 2>&1 | Out-String)
+        $codigo = $LASTEXITCODE
+        $agregados = ([regex]::Matches($salida, '(?i)instalad|installed|agregad|added')).Count
+        return [PSCustomObject]@{
+            Ok      = ($codigo -eq 0)
+            Detalle = ("codigo {0}, {1} coincidencias; {2}" -f $codigo, $agregados, (($salida -replace '\s+', ' ').Trim()))
+        }
+    } -Argumentos @($carpeta) -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) { Set-ToolsEstado ("Restaurar drivers: $errorTxt") 'error'; return }
+        if ($resultado.Ok) {
+            Set-ToolsEstado ("Drivers instalados. ({0})" -f $resultado.Detalle) 'ok'
+        } else {
+            Set-ToolsEstado ("Restaurar drivers con avisos: {0}" -f $resultado.Detalle) 'warn'
+        }
+        Write-Log ("Restaurar drivers: {0}" -f $resultado.Detalle)
+    }.GetNewClosure())
+}
+
+function Start-LimpiezaDrivers {
+    $fantasmas = @()
+    try {
+        $fantasmas = @(Get-PnpDevice -ErrorAction Stop | Where-Object { -not $_.Present -and $_.InstanceId })
+    } catch {
+        Show-Mensaje "No se pudo leer la lista de dispositivos (Get-PnpDevice).`n`n$($_.Exception.Message)" 'Drivers fantasma' 'Warning'
+        return
+    }
+
+    if ($fantasmas.Count -eq 0) {
+        Set-ToolsEstado 'No hay dispositivos fantasma que limpiar.' 'ok'
+        return
+    }
+
+    $r = [System.Windows.MessageBox]::Show(
+        ("Se encontraron {0} dispositivos desconectados (drivers fantasma).`n`nSe quitaran del sistema. No afecta al hardware conectado.`n`n¿Continuar?" -f $fantasmas.Count),
+        'Limpieza de drivers', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado ("Quitando {0} dispositivos fantasma..." -f $fantasmas.Count) 'info'
+    Start-Tarea -Script {
+        $ids = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { -not $_.Present -and $_.InstanceId } | Select-Object -ExpandProperty InstanceId)
+        $ok = 0; $fallo = 0
+        foreach ($id in $ids) {
+            try {
+                & pnputil.exe /remove-device "$id" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { $ok++ } else { $fallo++ }
+            } catch { $fallo++ }
+        }
+        return [PSCustomObject]@{ Ok = $true; Detalle = ("{0} quitados, {1} con error" -f $ok, $fallo) }
+    } -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) { Set-ToolsEstado ("Limpieza de drivers: $errorTxt") 'error'; return }
+        Set-ToolsEstado ("Limpieza de drivers: {0}." -f $resultado.Detalle) 'ok'
+        Write-Log ("Limpieza drivers: {0}" -f $resultado.Detalle)
+    }.GetNewClosure())
+}
+
+function Start-MiniBackupUsuario {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dlg.Description = 'Elige la carpeta o el USB donde guardar el respaldo'
+    $dlg.ShowNewFolderButton = $true
+    $dlg.SelectedPath = [Environment]::GetFolderPath('Desktop')
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+    $destino = Join-Path $dlg.SelectedPath ('BACKUP_{0}_{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    $r = [System.Windows.MessageBox]::Show(
+        ("Se copiaran Escritorio, Documentos, Imagenes, Descargas, Favoritos, Musica y Videos a:`n`n{0}`n`n¿Continuar?" -f $destino),
+        'Backup del usuario', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado 'Copiando archivos del usuario...' 'info'
+    Start-Tarea -Script {
+        param($destino)
+        $perfil = $env:USERPROFILE
+        $carpetas = @('Desktop', 'Documents', 'Pictures', 'Downloads', 'Favorites', 'Music', 'Videos')
+        if (-not (Test-Path $destino)) { New-Item -ItemType Directory -Path $destino -Force | Out-Null }
+
+        $copiadas = 0
+        $saltadas = 0
+        foreach ($c in $carpetas) {
+            $src = Join-Path $perfil $c
+            if (-not (Test-Path $src)) { continue }
+            $dst = Join-Path $destino $c
+            & robocopy.exe "$src" "$dst" /E /MT:16 /R:0 /W:0 /NP /XJ /FFT /A-:SH /XF desktop.ini *.tmp thumbs.db *.lock 2>$null | Out-Null
+            if ($LASTEXITCODE -lt 8) { $copiadas++ } else { $saltadas++ }
+        }
+
+        $leeme = @(
+            ("Respaldo hecho el {0}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm')),
+            ("Equipo: {0}   Usuario: {1}" -f $env:COMPUTERNAME, $env:USERNAME),
+            '',
+            'Si falta algun archivo, probablemente estaba abierto durante la copia.'
+        ) -join "`r`n"
+        Set-Content -Path (Join-Path $destino 'LEEME.txt') -Value $leeme -Encoding UTF8
+
+        $bytes = (Get-ChildItem $destino -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        return [PSCustomObject]@{
+            Ok      = $true
+            Detalle = ("{0} carpetas copiadas, {1} con error, {2} GB" -f $copiadas, $saltadas, [math]::Round($bytes / 1GB, 2))
+        }
+    } -Argumentos @($destino) -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) {
+            Set-ToolsEstado ("Backup del usuario: $errorTxt") 'error'
+            Write-Log ("Mini-Backup: {0}" -f $errorTxt) 'ERROR'
+            return
+        }
+        Set-ToolsEstado ("Backup del usuario listo: {0}" -f $resultado.Detalle) 'ok'
+        Write-Log ("Mini-Backup: {0} -> {1}" -f $resultado.Detalle, $destino)
+        try { Start-Process explorer.exe $destino } catch {}
+    }.GetNewClosure())
+}
+
+# --- REPARACIONES RAPIDAS ---
+function Start-RepararTienda {
+    $r = [System.Windows.MessageBox]::Show(
+        "Se reiniciara la cache de Microsoft Store (wsreset).`n`nLa ventana de la tienda se abre y se cierra sola; no borra aplicaciones.`n`n¿Continuar?",
+        'Reparar tienda', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado 'Reiniciando la cache de Microsoft Store...' 'info'
+    Start-Tarea -Script {
+        $p = Start-Process -FilePath 'wsreset.exe' -Wait -PassThru -WindowStyle Hidden
+        return [PSCustomObject]@{ Ok = ($p.ExitCode -eq 0); Detalle = ("wsreset codigo {0}" -f $p.ExitCode) }
+    } -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) { Set-ToolsEstado ("Reparar tienda: $errorTxt") 'error'; return }
+        if ($resultado.Ok) { Set-ToolsEstado 'Cache de Microsoft Store reiniciada.' 'ok' }
+        else { Set-ToolsEstado ("Reparar tienda con avisos: {0}" -f $resultado.Detalle) 'warn' }
+        Write-Log ("Reparar tienda: {0}" -f $resultado.Detalle)
+    }.GetNewClosure())
+}
+
+function Start-ChkDskRapido {
+    $r = [System.Windows.MessageBox]::Show(
+        "Se analizara el disco del sistema (chkdsk C: /scan).`n`nNo reinicia el equipo y tarda entre 1 y 5 minutos.`n`n¿Continuar?",
+        'Analizar disco', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    Set-ToolsEstado 'Analizando el disco del sistema...' 'info'
+    Start-Tarea -Script {
+        $p = Start-Process -FilePath 'chkdsk.exe' -ArgumentList 'C:', '/scan' -Wait -PassThru -WindowStyle Hidden
+        return [PSCustomObject]@{ Ok = ($p.ExitCode -eq 0); Detalle = ("chkdsk codigo {0}" -f $p.ExitCode) }
+    } -OnDone ({
+        param($resultado, $errorTxt)
+        if ($errorTxt) { Set-ToolsEstado ("Analizar disco: $errorTxt") 'error'; return }
+        if ($resultado.Ok) { Set-ToolsEstado 'Analisis de disco terminado sin errores.' 'ok' }
+        else { Set-ToolsEstado ("Analisis de disco: {0} (revisa el log)" -f $resultado.Detalle) 'warn' }
+        Write-Log ("CHKDSK: {0}" -f $resultado.Detalle)
+    }.GetNewClosure())
+}
+
+# --- REPORTE DE SALUD (HTML + PDF) ---
+function Convertir-HtmlAPdf {
+    param([string]$HtmlPath, [string]$PdfPath)
+    if (-not (Test-Path $HtmlPath)) { return $false }
+    $candidatos = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path $env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Google\Chrome\Application\chrome.exe')
+    )
+    $exe = $candidatos | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if (-not $exe) { return $false }
+    $uri = 'file:///' + ($HtmlPath -replace '\\', '/')
+    $argumentos = "--headless --disable-gpu --no-pdf-header-footer --print-to-pdf=`"$PdfPath`" `"$uri`""
+    try {
+        Start-Process -FilePath $exe -ArgumentList $argumentos -Wait -WindowStyle Hidden -ErrorAction Stop
+        for ($i = 0; $i -lt 30 -and -not (Test-Path $PdfPath); $i++) { Start-Sleep -Milliseconds 500 }
+        return (Test-Path $PdfPath)
+    } catch { return $false }
+}
+
+function New-InformeSaludHtml {
+    param($Registro, [string]$Destino)
+
+    $esc = {
+        param($v)
+        if ($null -eq $v) { return '&mdash;' }
+        $t = ([string]$v).Trim()
+        if (-not $t) { return '&mdash;' }
+        return ($t -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;')
+    }
+
+    $filas = {
+        param($pares)
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($p in $pares) {
+            $valor = & $esc $p[1]
+            [void]$sb.AppendLine(('<tr><th>{0}</th><td>{1}</td></tr>' -f (& $esc $p[0]), $valor))
+        }
+        return $sb.ToString()
+    }
+
+    $secciones = @(
+        @{ Titulo = 'Identificacion'; Filas = @(
+            @('Cliente', $Registro.Cliente)
+            @('Sede / tecnico', $Registro.Sede_Tecnico)
+            @('Orden / etiqueta', $Registro.Orden)
+            @('Fecha', ("{0} {1}" -f $Registro.Fecha, $Registro.Hora).Trim())
+            @('Registrado por', $Registro.Usuario)
+            @('Hostname', $Registro.Hostname)
+            @('Marca / modelo', ("{0} {1}" -f $Registro.Marca, $Registro.Modelo).Trim())
+            @('Serial', $Registro.Serial)
+            @('Tipo de equipo', $Registro.Tipo_Equipo)
+        ) }
+        @{ Titulo = 'Sistema operativo'; Filas = @(
+            @('Windows', $Registro.SO_Nombre)
+            @('Version / build', ("{0} build {1}" -f $Registro.SO_Version, $Registro.SO_Build).Trim())
+            @('Arquitectura', $Registro.SO_Arquitectura)
+            @('Instalado el', $Registro.SO_Instalado)
+            @('Ultimo arranque', $Registro.Ultimo_Arranque)
+            @('Horas encendido', $Registro.Uptime_Horas)
+            @('Dominio / grupo', $Registro.Dominio_Grupo)
+        ) }
+        @{ Titulo = 'Procesador y memoria'; Filas = @(
+            @('Procesador', $Registro.CPU_Modelo)
+            @('Nucleos / hilos', ("{0} / {1}" -f $Registro.CPU_Nucleos, $Registro.CPU_Hilos).Trim(' /'))
+            @('Velocidad', ("{0} GHz" -f $Registro.CPU_GHz).Trim())
+            @('RAM total', ("{0} GB" -f $Registro.RAM_Total_GB).Trim())
+            @('Tipo / velocidad', ("{0} {1} MHz" -f $Registro.RAM_Tipo, $Registro.RAM_Velocidad_MHz).Trim())
+            @('Modulos', $Registro.RAM_Modulos)
+            @('Slots (libres / total)', ("{0} / {1}" -f $Registro.RAM_Slots_Libres, $Registro.RAM_Slots).Trim(' /'))
+            @('Maximo soportado', ("{0} GB" -f $Registro.RAM_Max_GB).Trim())
+            @('Graficos', ("{0} {1}" -f $Registro.GPU, $Registro.GPU_VRAM).Trim())
+        ) }
+        @{ Titulo = 'Disco'; Filas = @(
+            @('Modelo', $Registro.Disco_Modelo)
+            @('Tipo', $Registro.Disco_Tipo)
+            @('Capacidad', ("{0} GB" -f $Registro.Disco_Capacidad_GB).Trim())
+            @('Libre', ("{0} GB" -f $Registro.Disco_Libre_GB).Trim())
+            @('Uso', ("{0} %" -f $Registro.Disco_Uso_Pct).Trim())
+            @('Salud', $Registro.Disco_Salud)
+            @('Temperatura', ("{0} C" -f $Registro.Disco_Temperatura_C).Trim())
+            @('Horas encendido', $Registro.Disco_Horas_Encendido)
+            @('Discos adicionales', $Registro.Discos_Extra)
+        ) }
+        @{ Titulo = 'Bateria'; Filas = @(
+            @('Presente', $Registro.Bateria_Presente)
+            @('Capacidad de diseno', ("{0} mWh" -f $Registro.Bateria_Diseno_mWh).Trim())
+            @('Capacidad actual', ("{0} mWh" -f $Registro.Bateria_Actual_mWh).Trim())
+            @('Desgaste', ("{0} %" -f $Registro.Bateria_Desgaste_Pct).Trim())
+            @('Ciclos', $Registro.Bateria_Ciclos)
+            @('Estado', $Registro.Bateria_Estado)
+            @('Voltaje', ("{0} V" -f $Registro.Bateria_Voltaje_V).Trim())
+            @('Potencia', ("{0} W" -f $Registro.Bateria_Potencia_W).Trim())
+        ) }
+        @{ Titulo = 'Red'; Filas = @(
+            @('IP', $Registro.IP)
+            @('MAC', $Registro.MAC)
+            @('Gateway', $Registro.Gateway)
+            @('Adaptadores', $Registro.Adaptadores)
+        ) }
+        @{ Titulo = 'Seguridad y licencias'; Filas = @(
+            @('TPM', $Registro.TPM)
+            @('Secure Boot', $Registro.SecureBoot)
+            @('Antivirus', $Registro.Antivirus)
+            @('Windows activado', $Registro.Windows_Activado)
+            @('Office', $Registro.Office_Version)
+            @('Office activado', $Registro.Office_Activado)
+            @('Programas instalados', $Registro.Software_Total)
+        ) }
+    )
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">')
+    [void]$sb.AppendLine('<title>Reporte de salud - ' + (& $esc $Registro.Hostname) + '</title>')
+    [void]$sb.AppendLine(@'
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; color: #1b2430; margin: 28px; font-size: 12px; }
+  header { border-bottom: 3px solid #0f9d58; padding-bottom: 10px; margin-bottom: 18px; }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: .5px; }
+  header .sub { color: #5b6b7b; font-size: 11.5px; margin-top: 3px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: #0b6b3f;
+       margin: 20px 0 6px; padding-bottom: 3px; border-bottom: 1px solid #d7dee5; }
+  table { width: 100%; border-collapse: collapse; }
+  tr:nth-child(even) { background: #f6f8fa; }
+  th { text-align: left; font-weight: 600; color: #46586b; width: 210px; padding: 5px 8px; vertical-align: top; }
+  td { padding: 5px 8px; }
+  footer { margin-top: 24px; padding-top: 8px; border-top: 1px solid #d7dee5;
+           color: #7a8a99; font-size: 10.5px; }
+</style></head><body>
+'@)
+    [void]$sb.AppendLine('<header><h1>Reporte de salud del equipo</h1>')
+    [void]$sb.AppendLine(('<div class="sub">{0} &middot; {1} &middot; generado el {2}</div></header>' -f
+        (& $esc $Registro.Hostname), (& $esc $Registro.Cliente), (Get-Date -Format 'yyyy-MM-dd HH:mm')))
+
+    foreach ($s in $secciones) {
+        [void]$sb.AppendLine(('<h2>{0}</h2><table>{1}</table>' -f (& $esc $s.Titulo), (& $filas $s.Filas)))
+    }
+
+    if ($Registro.Comentarios) {
+        [void]$sb.AppendLine(('<h2>Observaciones</h2><p>{0}</p>' -f (& $esc $Registro.Comentarios)))
+    }
+
+    [void]$sb.AppendLine('<footer>Wiggles Mini &middot; inventario y diagnostico en sitio</footer></body></html>')
+    Set-Content -Path $Destino -Value $sb.ToString() -Encoding UTF8
+}
+
+function Start-ReporteSalud {
+    if (-not $script:RegistroActual) {
+        Show-Mensaje "Primero escanea el equipo en la pestana INVENTARIO.`n`nEl reporte se arma con los datos del ultimo escaneo." 'Reporte de salud' 'Information'
+        return
+    }
+
+    $html = Join-Path $script:DataDir ('Salud_{0}_{1}.html' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmm'))
+    Set-ToolsEstado 'Generando reporte de salud...' 'info'
+    try {
+        New-InformeSaludHtml -Registro $script:RegistroActual -Destino $html
+        $pdf = [System.IO.Path]::ChangeExtension($html, '.pdf')
+        if (Convertir-HtmlAPdf -HtmlPath $html -PdfPath $pdf) {
+            Set-ToolsEstado ("Reporte de salud en PDF: {0}" -f (Split-Path $pdf -Leaf)) 'ok'
+            Write-Log ("Reporte de salud PDF: {0}" -f $pdf)
+            Start-Process $pdf
+        } else {
+            Set-ToolsEstado 'No se pudo generar el PDF (falta Edge o Chrome). Se abre el HTML.' 'warn'
+            Write-Log 'Reporte de salud: PDF no disponible, se abre el HTML' 'WARN'
+            Start-Process $html
+        }
+    } catch {
+        Set-ToolsEstado ("Reporte de salud: {0}" -f $_.Exception.Message) 'error'
+        Write-Log ("Reporte de salud: {0}" -f $_.Exception.Message) 'ERROR'
+    }
+}
+
+function Construir-PanelConfig {
+    $pnlFeatures.Children.Clear()
+    $pnlPaneles.Children.Clear()
+
+    foreach ($f in @($script:WinFeatures)) {
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Tag = $f
+        $cb.Content = $f.Nombre
+        $cb.Width = 300
+        $cb.Margin = '2,4,10,4'
+        $cb.ToolTip = $f.Descripcion
+        $pnlFeatures.Children.Add($cb) | Out-Null
+    }
+
+    foreach ($p in @($script:PanelesClasicos)) {
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Content = $p.Nombre
+        $btn.Tag = $p
+        $btn.Height = 30
+        $btn.Padding = '10,0'
+        $btn.Margin = '0,0,8,8'
+        $btn.Add_Click({
+            param($s, $e)
+            $panel = $s.Tag
+            try {
+                if ($panel.Args) { Start-Process -FilePath $panel.Exe -ArgumentList $panel.Args }
+                else { Start-Process -FilePath $panel.Exe }
+            } catch {
+                Show-Mensaje "No se pudo abrir $($panel.Nombre): $($_.Exception.Message)" 'Paneles' 'Warning'
+            }
+        })
+        $pnlPaneles.Children.Add($btn) | Out-Null
+    }
+}
+
+function Start-InstalarFeatures {
+    # Recoger checkboxes marcados
+    $sel = @()
+    foreach ($cb in @($pnlFeatures.Children)) {
+        if ($cb -is [System.Windows.Controls.CheckBox] -and $cb.IsChecked) { $sel += $cb.Tag }
+    }
+    if ($sel.Count -eq 0) { Show-Mensaje 'Marca al menos una caracteristica.' 'Caracteristicas'; return }
+
+    $nombres = (@($sel | ForEach-Object { $_.Nombre }) -join ', ')
+    $r = [System.Windows.MessageBox]::Show(
+        "Se instalaran:$nombres`n`nPuede requerir reinicio y descarga desde Windows Update. ¿Continuar?",
+        'Caracteristicas de Windows', 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+
+    $payload = [PSCustomObject]@{ Features = $sel; Log = $script:LogFile }
+    Set-ConfigEstado 'Instalando caracteristicas de Windows...' 'info'
+    Start-Tarea -Script {
+        param($p)
+        $ok = 0
+        $fail = @()
+        foreach ($f in $p.Features) {
+            foreach ($name in @($f.Features)) {
+                try {
+                    Enable-WindowsOptionalFeature -Online -FeatureName $name -All -NoRestart -ErrorAction Stop | Out-Null
+                    $ok++
+                } catch {
+                    $fail += ("{0}: {1}" -f $name, $_.Exception.Message)
+                }
+            }
+        }
+        return [PSCustomObject]@{ Ok=$ok; Fallidos=@($fail) }
+    } -Argumentos @(, $payload) -OnDone {
+        param($resultado, $errorTxt)
+        if ($resultado) {
+            if (@($resultado.Fallidos).Count -eq 0) {
+                Set-ConfigEstado ("Caracteristicas instaladas: {0}. Puede requerir reinicio." -f $resultado.Ok) 'ok'
+            } else {
+                Set-ConfigEstado ("Instaladas: {0} · fallidas: {1}" -f $resultado.Ok, @($resultado.Fallidos).Count) 'warn'
+                Write-Log ("Features fallidas: " + (@($resultado.Fallidos) -join ' | ')) 'WARN'
+            }
+        } else {
+            Set-ConfigEstado "Error instalando caracteristicas: $errorTxt" 'error'
+        }
+    }
+}
+
+# =============================================================================
+#  EXPORTAR
+# =============================================================================
+function Start-ExportarExcel {
+    Set-Estado 'Generando Excel...' 'info'
+    $cliente = $txtCliente.Text.Trim()
+    $csv = Get-CsvPath -DataDir $script:DataDir -Cliente $cliente
+    if (-not (Test-Path $csv)) {
+        $csv = Get-ChildItem -Path $script:DataDir -Filter 'Inventario_*.csv' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $csv -or -not (Test-Path $csv)) {
+        Set-Estado 'Todavia no hay registros para exportar' 'warn'
+        return
+    }
+
+    $xlsx = [System.IO.Path]::ChangeExtension($csv, '.xlsx')
+    try {
+        Export-CsvToXlsx -CsvPath $csv -XlsxPath $xlsx | Out-Null
+        Set-Estado "Excel generado: $(Split-Path $xlsx -Leaf)" 'ok'
+        Write-Log "Excel exportado: $xlsx"
+        Start-Process $xlsx
+    } catch {
+        Set-Estado "No se pudo generar el Excel: $($_.Exception.Message)" 'error'
+        Write-Log "Exportar Excel: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+# =============================================================================
+#  EVENTOS
+# =============================================================================
+$btnMin.Add_Click({ $Window.WindowState = 'Minimized' })
+$btnCerrar.Add_Click({ $Window.Close() })
+
+$btnEscanear.Add_Click({ Start-Escaneo })
+$btnGuardar.Add_Click({ Guardar-Registro -Siguiente $false | Out-Null })
+$btnGuardarSiguiente.Add_Click({ Guardar-Registro -Siguiente $true | Out-Null })
+
+$btnExcel.Add_Click({ Start-ExportarExcel })
+$btnSincronizar.Add_Click({ Start-Sincronizacion })
+
+$btnCarpeta.Add_Click({
+    try { Start-Process explorer.exe $script:DataDir } catch {}
+})
+
+$btnEdicion.Add_Click({ Start-CambioEdicion })
+$btnBloatware.Add_Click({ Start-Bloatware })
+$btnRendimiento.Add_Click({ Start-Rendimiento })
+$btnRed.Add_Click({ Start-FixRed })
+$btnPuntoRestauracion.Add_Click({ Start-PuntoRestauracion })
+$btnAdminLocal.Add_Click({ Start-AdminLocal })
+$btnClaveBios.Add_Click({ Show-ClaveBios })
+$btnReporteBateria.Add_Click({ Start-ReporteBateria })
+$btnResumenEquipo.Add_Click({ Show-ResumenEquipo })
+
+$btnOffice.Add_Click({ Start-InstalarOffice })
+$btnQuitarOffice.Add_Click({ Start-QuitarOffice })
+$btnApps.Add_Click({ Start-AppsBasicas })
+$btnInstalarApps.Add_Click({ Start-InstalarSeleccionadas })
+$btnAppsRecomendadas.Add_Click({
+    foreach ($app in @($script:AppsCatalogo)) { $app.Seleccionada = [bool]$app.Recomendada }
+    Update-ListaApps
+})
+$btnAppsLimpiar.Add_Click({
+    foreach ($app in @($script:AppsCatalogo)) { $app.Seleccionada = $false }
+    Update-ListaApps
+})
+$txtBuscarApp.Add_TextChanged({ Update-ListaApps })
+$cmbCategoriaApp.Add_SelectionChanged({ Update-ListaApps })
+$btnRuntimes.Add_Click({ Start-Runtimes })
+$btnAbrirCatalogo.Add_Click({ Select-Tab 'APLICACIONES' })
+$btnAbrirAppx.Add_Click({ Select-Tab 'APPX' })
+$txtBuscarSoftware.Add_TextChanged({ Update-SoftwareInstalado })
+
+$tabs.Add_SelectionChanged({
+    try {
+        $h = [string]$tabs.SelectedItem.Header
+        if ($h -eq 'SISTEMA') { Update-EstadoSistema }
+        elseif ($h -eq 'SOFTWARE') { Update-SoftwareInstalado }
+    } catch {}
+})
+
+# Ajustes
+$btnTweaksRecargar.Add_Click({
+    Load-TweaksEstado
+    Update-TweakBotonTodos
+    $txtTweaksEstado.Text = "Estado actualizado: {0} ajustes aplicados." -f @($script:TweaksEstado.PSObject.Properties).Count
+})
+
+# AppX
+$btnAppxQuitar.Add_Click({ Start-QuitarAppx })
+$btnAppxInstalar.Add_Click({ Start-InstalarAppx })
+$btnAppxPredeterminados.Add_Click({
+    foreach ($a in @($script:AppxCatalogo)) {
+        $a.Seleccionada = [bool]$a.Predeterminada
+        $cb = $script:AppxChecks[$a.Id]
+        if ($cb) { $cb.IsChecked = [bool]$a.Seleccionada }
+    }
+    Update-ResumenAppx
+})
+$btnAppxLimpiar.Add_Click({
+    foreach ($a in @($script:AppxCatalogo)) { $a.Seleccionada = $false }
+    foreach ($cb in $script:AppxChecks.Values) { $cb.IsChecked = $false }
+    Update-ResumenAppx
+})
+$btnAppxDetectar.Add_Click({ Detectar-Appx })
+
+# Config
+$btnFixSFC.Add_Click({ Start-FixSFC })
+$btnFixWU.Add_Click({ Start-FixWU })
+$btnFixNTP.Add_Click({ Start-FixNTP })
+$btnFixTemp.Add_Click({ Start-FixTemp })
+$btnFixDISM.Add_Click({ Start-FixDISM })
+$btnCompactOS.Add_Click({ Start-CompactOS })
+$btnFixWinget.Add_Click({ Start-RepararWinget })
+$btnInstalarFeatures.Add_Click({ Start-InstalarFeatures })
+
+# Respaldo y chequeo
+$btnMiniBackupUsuario.Add_Click({ Start-MiniBackupUsuario })
+$btnRepararTienda.Add_Click({ Start-RepararTienda })
+$btnChkDsk.Add_Click({ Start-ChkDskRapido })
+$btnReporteSalud.Add_Click({ Start-ReporteSalud })
+
+# Herramientas (drivers + portables + fabricantes)
+$btnBackupDrivers.Add_Click({ Start-BackupDrivers })
+$btnRestaurarDrivers.Add_Click({ Start-RestaurarDrivers })
+$btnLimpiezaDrivers.Add_Click({ Start-LimpiezaDrivers })
+$btn3DPChip.Add_Click({
+    $h = @($script:ToolsCatalogo | Where-Object { $_.Id -eq '3DPChip' }) | Select-Object -First 1
+    if ($h) { Invoke-Herramienta -H $h }
+})
+$btnToolsActualizar.Add_Click({ Update-PanelTools })
+$btnToolsCarpeta.Add_Click({
+    try { Start-Process explorer.exe (Get-ToolsDir) }
+    catch { Set-ToolsEstado ("No se pudo abrir la carpeta: {0}" -f $_.Exception.Message) 'error' }
+})
+
+# Atajos de teclado
+$Window.Add_KeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'F5') { Start-Escaneo; $e.Handled = $true }
+    if ($e.Key -eq 'F8') { Guardar-Registro -Siguiente $true | Out-Null; $e.Handled = $true }
+})
+
+$txtSerial.Add_KeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Return') { $txtComentario.Focus() | Out-Null }
+})
+
+# =============================================================================
+#  ARRANQUE
+# =============================================================================
+$Window.Add_Loaded({
+    Write-Log ("Wiggles Mini {0} iniciado en {1}" -f $script:AppVersion, $script:Root)
+    Write-Log ("Administrador: {0} · Equipo: {1}" -f (Test-EsAdmin), $env:COMPUTERNAME)
+
+    if ($script:Config['Cliente']) { $txtCliente.Text = $script:Config['Cliente'] }
+    if ($script:Config['Tecnico']) { $txtSede.Text = $script:Config['Tecnico'] }
+    $txtOrden.Text = ''
+    $txtAppsLista.Text = (@($script:Config['AppsBasicas']) -join ' · ')
+
+    Actualizar-EstadoOffice
+    Inicializar-CatalogoApps
+    Load-TweaksEstado
+    Construir-PanelTweaks
+    Construir-PanelAppx
+    Construir-PanelConfig
+    Update-PanelTools
+    Detectar-Appx
+    Update-Contadores
+
+    # Estado de licencias en segundo plano
+    Start-Tarea -Script {
+        param($corePath)
+        . $corePath
+        $lic = Get-EstadoLicencia
+        return $lic
+    } -Argumentos @($script:CorePath) -OnDone {
+        param($lic, $errorTxt)
+        if ($lic) {
+            $txtLicencia.Text = "Windows: {0}   |   Office: {1}" -f $lic.Windows, $lic.Office
+            $txtLicencia.Foreground = if ($lic.Windows -eq 'Activado') { '#B9F6CA' } else { '#FFB300' }
+        }
+    }
+
+    Set-Estado 'Listo. Escanea el primer equipo.' 'ok'
+})
+
+$Window.Add_Closing({
+    Save-Config
+    Write-Log 'Sesion finalizada.'
+})
+
+# Limpieza de tareas al cerrar
+$Window.Add_Closed({
+    foreach ($t in @($script:Tareas)) {
+        try { $t.PS.Stop() } catch {}
+        try { $t.PS.Dispose() } catch {}
+        try { $t.RS.Dispose() } catch {}
+    }
+})
+
+# Arrancar escaneo automatico del primer equipo (espera a que terminen las tareas iniciales)
+$Window.Add_ContentRendered({
+    $script:TimerEscaneoInicial = New-Object System.Windows.Threading.DispatcherTimer
+    $script:TimerEscaneoInicial.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:TimerEscaneoInicial.Add_Tick({
+        if ($script:TareasActivas -gt 0) { return }
+        $script:TimerEscaneoInicial.Stop()
+        Start-Escaneo
+    })
+    $script:TimerEscaneoInicial.Start()
+})
+
+[void]$Window.ShowDialog()
