@@ -168,10 +168,16 @@ Si todavía no tienes dominio, usa un acortador que redirija directo (sin págin
 intermedia). El proyecto ya tiene dos:
 
 ```powershell
-irm "https://is.gd/wiggles" | iex
+irm "https://is.gd/wigglesmini" | iex
 ```
 
-Respaldo: `https://tinyurl.com/wiggles-irm`.
+O el alias ultracorto:
+
+```powershell
+irm "https://is.gd/wmini" | iex
+```
+
+Respaldo: `https://tinyurl.com/wiggles-mini`.
 
 Ventaja: funciona en segundos. Desventaja: depende de un servicio externo y el
 alias no se puede editar si lo creaste sin cuenta. Para algo permanente y con tu

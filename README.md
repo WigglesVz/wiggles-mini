@@ -410,11 +410,17 @@ irm "https://raw.githubusercontent.com/WigglesVz/wiggles-mini/main/irm.ps1" | ie
 Enlaces cortos (más fáciles de recordar):
 
 ```powershell
-irm "https://is.gd/wiggles" | iex
+irm "https://is.gd/wigglesmini" | iex
 ```
 
-Respaldo: `https://tinyurl.com/wiggles-irm`. Ambos redirigen al `irm.ps1` del
-repositorio; si algún día cambias de repositorio, crea un alias nuevo.
+O también el más corto:
+
+```powershell
+irm "https://is.gd/wmini" | iex
+```
+
+Respaldo: `https://tinyurl.com/wiggles-mini`. Todos redirigen al `irm.ps1` del
+repositorio en `WigglesVz/wiggles-mini`.
 
 `irm.ps1` descarga la herramienta a `%TEMP%\WigglesMini`, pide administrador y la abre.
 Siempre trae la última versión publicada. Trae también `tools.json`, así que la pestaña
